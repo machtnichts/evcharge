@@ -21,3 +21,7 @@ venv/
 
 # Local notes that must never be published
 NOTES-local.md
+
+# Local-only tools and parked variants (references to the retired third-party
+# controller live here, not in the repository)
+local-tools/
