@@ -1,0 +1,23 @@
+# Live settings - written back by the running app, machine specific.
+config.json
+config.json.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Run artifacts (the service writes its log next to the project)
+*.log
+*.stdout
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local notes that must never be published
+NOTES-local.md

@@ -1,0 +1,16 @@
+[Unit]
+Description=EV Charge WT - charging controller (standalone, outside Home Assistant)
+After=network-online.target muxproxy-rs.service
+Wants=muxproxy-rs.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/adermake/EV-CHARGER-WT-HA/ha-app
+ExecStart=/usr/bin/python3 -m evcharge.main
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/adermake/EV-CHARGER-WT-HA/logs/evcharge.stdout
+StandardError=append:/home/adermake/EV-CHARGER-WT-HA/logs/evcharge.stdout
+
+[Install]
+WantedBy=default.target

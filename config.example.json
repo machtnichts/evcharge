@@ -1,0 +1,74 @@
+{
+  "_comment": "Example configuration. Copy to config.json and adapt. config.json is ignored by git because the running service writes applied settings back into it. Anything left empty (mqtt user/password) is optional; the Home Assistant token is never stored here - it comes from HASS_URL/HASS_TOKEN in the environment or from a 0600 env file.",
+  "site": {
+    "host": "127.0.0.1",
+    "port": 1503,
+    "unit": 1,
+    "battery_capacity_kwh": 10.0
+  },
+  "charger": {
+    "host": "192.168.178.22",
+    "phase": 1
+  },
+  "interval_s": 30,
+  "http": {
+    "host": "0.0.0.0",
+    "port": 7080
+  },
+  "mqtt": {
+    "enabled": false,
+    "host": "core-mosquitto",
+    "port": 1883,
+    "user": "",
+    "password": "",
+    "topic_prefix": "evcharge",
+    "discovery_prefix": "homeassistant"
+  },
+  "garage_pv": {
+    "enabled": true,
+    "entity": "sensor.garage_pv_leistung",
+    "every_s": 60,
+    "timeout_s": 3
+  },
+  "proxy_status": {
+    "enabled": true,
+    "url": "http://192.168.178.44:1504/status",
+    "every_s": 15,
+    "timeout_s": 3
+  },
+  "safety": {
+    "threshold": 5,
+    "window_min": 30
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "/var/log/evcharge.log"
+  },
+  "settings": {
+    "mode": "pv",
+    "min_current": 6.0,
+    "max_current": 14.0,
+    "phases": 1,
+    "voltage_nominal": 230.0,
+    "enable_threshold_w": 0.0,
+    "disable_threshold_w": 0.0,
+    "enable_delay_s": 60,
+    "disable_delay_s": 180,
+    "buffer_soc": 80.0,
+    "priority_soc": 55.0,
+    "residual_power_w": 0,
+    "cheap_hours": [
+      "00:00-05:00"
+    ],
+    "cheap_price_per_kwh": 0.18,
+    "grid_price_per_kwh": 0.28,
+    "feed_in_per_kwh": 0.12,
+    "control_enabled": false,
+    "max_current_step": 1.0,
+    "min_change_interval_s": 30,
+    "plan_energy_kwh": 0.0,
+    "plan_deadline": "",
+    "site_stale_s": 600.0,
+    "timezone": "Europe/Berlin"
+  }
+}

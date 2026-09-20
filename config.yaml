@@ -1,0 +1,73 @@
+name: "EV Charge WT"
+version: "0.1.0"
+slug: "evcharge_wt"
+description: "Plant-specific EV charging controller for SolarEdge + go-e Charger HOME+, reading the inverter through the local Modbus proxy"
+url: "https://github.com/local/EV-CHARGER-WT-HA"
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+startup: application
+boot: auto
+init: false
+host_network: false
+ports:
+  "7080/tcp": 7080
+ports_description:
+  "7080/tcp": "Web UI and REST API"
+options:
+  site_host: "192.168.178.44"
+  site_port: 1503
+  site_unit: 1
+  battery_capacity_kwh: 10.0
+  charger_host: "192.168.178.22"
+  interval_s: 30
+  http_port: 7080
+  mqtt_enabled: true
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  log_level: "INFO"
+  mode: "pv"
+  min_current: 6
+  max_current: 14
+  phases: 1
+  enable_delay_s: 60
+  disable_delay_s: 180
+  buffer_soc: 80
+  priority_soc: 55
+  residual_power_w: 0
+  cheap_hours: "00:00-05:00"
+  plan_energy_kwh: 0
+  plan_deadline: ""
+  control_enabled: false
+schema:
+  site_host: str
+  site_port: port
+  site_unit: int(1,247)
+  battery_capacity_kwh: float(0,100)
+  charger_host: str
+  interval_s: int(2,120)
+  http_port: port
+  mqtt_enabled: bool
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_user: str?
+  mqtt_password: password?
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
+  mode: list(off|now|minpv|pv|manual)
+  min_current: float(6,32)
+  max_current: float(6,32)
+  phases: int(1,3)
+  enable_delay_s: int(0,3600)
+  disable_delay_s: int(0,3600)
+  buffer_soc: float(0,100)
+  priority_soc: float(0,100)
+  residual_power_w: float(0,20000)
+  cheap_hours: str
+  plan_energy_kwh: float(0,200)
+  plan_deadline: str
+  control_enabled: bool
