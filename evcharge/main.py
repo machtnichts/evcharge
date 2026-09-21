@@ -503,7 +503,7 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row" id="d_amp_row"><span>target current</span><span class="v" id="d_amp">-</span></div>
   <div class="row"><span>surplus</span><span class="v" id="d_surplus">-</span></div>
   <div class="row"><span>reason</span><span class="v" id="d_reason">-</span></div>
-  <div class="row" id="d_safety_row" style="display:none"><span>switching 30 min</span><span class="v" id="d_safety">-</span></div>
+  <div class="row" id="d_safety_row" style="display:none"><span>stops 30 min</span><span class="v" id="d_safety">-</span></div>
   <button id="clearfault" style="display:none">Clear fault</button>
   <div class="row" id="d_cheap_row" style="display:none"><span>cheap window</span><span class="v" id="d_cheap">-</span></div>
   <div class="row" id="d_blocked_row" style="display:none"><span>blocked by</span><span class="v warn" id="d_blocked">-</span></div>
@@ -671,7 +671,7 @@ async function load(){
  const changes=sf.changes||0, limit=sf.threshold||5;
  sch.textContent=changes+" / "+limit+" in "+(sf.window_min||30)+" min";
  sch.className="v"+(sf.fault?" bad":(changes>=Math.max(1,limit-2)?" warn":""));
- sch.title="charging on/off edges actually written to the wallbox in the sliding window"
+ sch.title="charging stops actually written to the wallbox in the sliding window"
    +(sf.fault?(" | FAULT since "+(sf.fault_min_ago!=null?Math.round(sf.fault_min_ago)+" min ago":"just now")+": "+sf.fault_reason):"");
  srow.style.display=(changes>0||sf.fault)?"":"none";
  const cfb=document.getElementById("clearfault");

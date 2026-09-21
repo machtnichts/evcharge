@@ -218,6 +218,20 @@ class ChargingController:
     def _power_for_current(self, amps: float, phases: Optional[int] = None) -> float:
         return amps * (phases or self.s.phases) * self.s.voltage_nominal
 
+    def _floor_w(self, min_start: float, charger: ChargerState) -> float:
+        """The surplus the floor demands right now - asymmetric on purpose.
+
+        While the wallbox is still switched off, starting needs the minimum *plus* the
+        enable margin, so a surplus that merely touches the minimum does not open a session.
+        While it is switched on, holding only needs the minimum *minus* the disable margin,
+        so a passing cloud does not end one. Without the two margins a surplus sitting on
+        the minimum starts and stops the charge every few minutes - the switching the safety
+        counter exists to catch (measured: 5 stops in 30 minutes on 20.09.2026).
+        """
+        if charger.enabled:
+            return max(0.0, min_start - self.s.disable_threshold_w)
+        return min_start + self.s.enable_threshold_w
+
     def _active_phases(self, charger: ChargerState, now: Optional[datetime] = None) -> int:
         """Phase count to use in the power<->current maths.
 
@@ -426,36 +440,42 @@ class ChargingController:
 
         if s.mode == MODE_MINPV:
             min_start = self._power_for_current(lo, ph)
+            floor = self._floor_w(min_start, charger)
             d.available_w = round(surplus, 1)
-            if surplus >= min_start + s.enable_threshold_w:
+            if ph and surplus >= floor:
                 d.charge = True
                 d.target_current = lo
-                d.reason = "minpv: surplus %.0f W >= %.0f W (%dp)" % (surplus, min_start, ph)
+                d.reason = "minpv: surplus %.0f W >= %.0f W (%dp)" % (surplus, floor, ph)
             else:
                 d.charge = False
-                d.reason = "minpv: surplus %.0f W below %.0f W (%dp)" % (surplus, min_start, ph)
+                d.reason = "minpv: surplus %.0f W below %.0f W (%dp)" % (surplus, floor, ph)
             return self._finalize(d, charger, now)
 
         # MODE_PV (and MODE_CHEAP outside its cheap window): the current follows the
         # surplus immediately - no ramp, no band. Inside 6..max A there is nothing to
         # smooth: the target *is* the surplus, so following it at once uses the sun
-        # instead of trailing it. Hysteresis belongs only at the floor: below the
-        # minimum the car cannot be charged at all, so the decision says stop and
-        # _finalize's disable grace holds the charge at the minimum instead - with the
-        # countdown visible in the web UI.
+        # instead of trailing it. Hysteresis belongs only at the floor, and there it is
+        # asymmetric (see _floor_w): the start demands the minimum plus the enable margin,
+        # the hold only the minimum minus the disable margin. Below the floor the car
+        # cannot be charged at all, so the decision says stop and _finalize's disable grace
+        # holds the charge at the minimum instead - with the countdown visible in the web UI.
         tag = "cheap_hours" if s.mode == MODE_CHEAP else "pv"
         raw = surplus / (ph * s.voltage_nominal) if ph else 0.0
-        target = max(0.0, min(hi, raw))
+        min_start = self._power_for_current(lo, ph)
+        floor = self._floor_w(min_start, charger)
         d.available_w = round(surplus, 1)
 
-        if target >= lo:
+        if ph and surplus >= floor:
             d.charge = True
-            d.target_current = target
-            d.reason = "%s: surplus %.0f W -> %.1f A (%dp)" % (tag, surplus, target, ph)
+            # Inside the band the surplus alone is under the minimum, so clamp to it: the
+            # car keeps charging at 6 A and the small deficit comes off the house battery,
+            # which is the whole point of holding instead of stopping.
+            d.target_current = max(lo, min(hi, raw))
+            d.reason = "%s: surplus %.0f W -> %.1f A (%dp)" % (
+                tag, surplus, d.target_current, ph)
         else:
             d.charge = False
-            d.reason = "%s: surplus %.0f W below minimum (%.0f W, %dp)" % (
-                tag, surplus, self._power_for_current(lo, ph), ph)
+            d.reason = "%s: surplus %.0f W below minimum (%.0f W, %dp)" % (tag, surplus, floor, ph)
         return self._finalize(d, charger, now)
 
     # -- plan ------------------------------------------------------------
@@ -510,19 +530,29 @@ class ChargingController:
             d.charge = bool(d.charge and d.target_current > 0)
             return d
 
-        if d.charge and not charger.charging:
+        # Dwell timers are keyed on the box's *permission* (alw -> enabled), not on the car's
+        # actual draw (car==2 -> charging) - the same quantity hardware_actions compares
+        # against. Keying them on `charging` produced the stops the owner saw on 20.09.2026:
+        # a plugged car that is not drawing (full, or on a departure timer) made
+        # `d.charge and not charger.charging` true in *every* cycle, so the enable grace
+        # re-armed every cycle, the decision was forced to charge=False, and the write path -
+        # which compares against `enabled` - dutifully switched the box off. One stop per
+        # minute with plenty of surplus, five of them inside the safety window.
+        if d.charge and not charger.enabled:
             self._enable_since = self._enable_since or t
         else:
             self._enable_since = None
-        if not d.charge and charger.charging:
+        if not d.charge and charger.enabled:
             self._disable_since = self._disable_since or t
         else:
             self._disable_since = None
 
         # The remaining grace time is published on the decision so the web UI can show a
         # countdown ("stopping charging in 2 min if it doesn't get better") instead of a
-        # bare reason string.
-        if not charger.charging:
+        # bare reason string. While a grace runs the decision keeps the *opposite* of what
+        # it is waiting for, and because the timers now follow `enabled`, that no longer
+        # produces a write: `stopping` is only true when the box is really enabled.
+        if not charger.enabled:
             if self._enable_since and (t - self._enable_since) < s.enable_delay_s:
                 d.charge = False
                 d.enable_in_s = round(s.enable_delay_s - (t - self._enable_since), 1)

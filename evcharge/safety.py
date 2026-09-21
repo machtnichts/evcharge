@@ -2,10 +2,16 @@
 
 A car's on-board charger is not a switch. Cycling the charging enable every few minutes -
 which a control bug can do all night without anyone noticing - is exactly the kind of
-thing that ends in a four-figure repair bill. So the app counts the transitions it really
+thing that ends in a four-figure repair bill. So the app counts the *stops* it really
 applies to the wallbox over a sliding window, shows that number in the web UI, and when it
 crosses a threshold it latches into a fault: turn the charge ON once, then write nothing
 more to the wallbox, leaving the car charging steadily instead of being switched.
+
+Stops, not edges: every start is the counterpart of a stop, so counting both directions
+reported one interrupted session as two events and halved the tolerance the owner set. The
+stop is also the edge that actually hurts - it is the moment the car's charger loses its
+supply - while a start only puts it back. Current-limit changes (``amx=…``) are not
+switching and never count.
 
 The fault latches on purpose and does not clear when the counter decays: whatever produced
 the cycling may still be present, so releasing it is a human decision (the UI button, or a
@@ -22,11 +28,11 @@ DEFAULT_WINDOW_S = 1800.0        # 30 minutes
 
 
 class SwitchCounter:
-    """Counts the charging on/off transitions applied in the last `window_s` seconds.
+    """Counts the charging *stops* applied in the last `window_s` seconds.
 
-    Only real applied writes count (``alw=0`` / ``alw=1``), and only when the value
-    actually *changes* - re-asserting the same state is not a transition and must not
-    trip the safety net.
+    Only real applied writes count (``alw=0`` / ``alw=1``), and only stops: an ``alw=0``
+    that actually follows an ``alw=1``. Re-asserting the same state is not a transition,
+    and ``amx=…`` (the current limit) is not switching at all.
     """
 
     def __init__(self, threshold: int = DEFAULT_THRESHOLD,
@@ -40,11 +46,19 @@ class SwitchCounter:
 
     # -- recording ------------------------------------------------------
     def note(self, command: str, now: Optional[float] = None) -> Optional[str]:
-        """Record an applied ``alw=…`` write; return a fault reason if it just latched."""
+        """Record an applied ``alw=…`` write; return a fault reason if it just latched.
+
+        Only **stops** count - an ``alw=0`` that really follows an ``alw=1``. Every start is
+        the counterpart of a stop, so counting both directions reported one interrupted
+        session as two events and halved the tolerance. The stop is also the edge that
+        hurts: it is the moment the car's on-board charger loses its supply mid-session.
+        ``amx=…`` never counts (re-limiting is not switching), and re-asserting a state is
+        not a transition at all.
+        """
         now = time.time() if now is None else now
         if command not in ("alw=0", "alw=1"):
             return None
-        if self._last is not None and command != self._last:
+        if command == "alw=0" and self._last == "alw=1":
             self._events.append((now, command))
         self._last = command
         return self._check(now)
@@ -60,7 +74,7 @@ class SwitchCounter:
         self._prune(now)
         if len(self._events) >= self.threshold:
             self.fault_since = now
-            self.fault_reason = ("%d charging on/off changes within %.0f minutes"
+            self.fault_reason = ("%d charging stops within %.0f minutes"
                                  % (len(self._events), self.window_s / 60.0))
             return self.fault_reason
         return None

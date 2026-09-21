@@ -2,7 +2,7 @@
 """Decision-logic tests: no hardware, deterministic SiteState/ChargerState."""
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -20,7 +20,10 @@ def check(name, cond, detail=""):
     # check that was deleted or parked behind an early return.
     global TOTAL
     TOTAL += 1
-    print("  %-62s %s%s" % (name, "PASS" if cond else "FAIL", (" - " + detail) if detail else ""))
+    # str() on purpose: several checks hand a list of charger writes straight in as the
+    # detail, and that is exactly the output one wants to read when it fails.
+    print("  %-62s %s%s" % (name, "PASS" if cond else "FAIL",
+                            (" - " + str(detail)) if detail != "" else ""))
     if not cond:
         FAILS.append(name)
 
@@ -32,9 +35,15 @@ def site(pv=4000, grid=-1000, bat=-500, soc=90):
     return s
 
 
-def car(connected=True, charging=False, power=0, max_current=0):
+def car(connected=True, charging=False, power=0, max_current=0, enabled=None):
     c = ChargerState()
     c.connected, c.charging, c.power, c.max_current = connected, charging, power, max_current
+    # The wallbox's permission (`enabled`, i.e. alw) follows the car's draw unless a test
+    # says otherwise: current cannot flow while the box is not enabling. The controller
+    # keys its dwell timers *and* its writes on `enabled` - the draw is only what the car
+    # does with the permission - so a fixture with charging=True and enabled=False would
+    # describe a state the hardware cannot produce.
+    c.enabled = bool(charging) if enabled is None else enabled
     c.car_state = "charging" if charging else ("waiting" if connected else "idle")
     return c
 
@@ -481,6 +490,101 @@ d = c.decide(site(grid=-3000, soc=95), car(connected=True), now=pm, session_kwh=
              site_stale_s=300.0)
 check("5 min of staleness is inside the tolerance -> normal sun tracking",
       d.charge and d.target_current > 12.0, d.reason)
+
+print("a plugged car that is not drawing must not be stopped every cycle")
+# The 20.09.2026 incident, in the owner's words: the app must not send alw=0 unnecessarily.
+# The enable grace was keyed on the car's *draw*, so a wallbox that was enabled with a full
+# (or departure-scheduled) car re-armed it in every single cycle: the decision was forced to
+# charge=False, and the write path - which compares against the box's permission - switched
+# the charge off. One stop per minute with 2 kW of surplus, five of them inside the safety
+# window. Ten cycles now have to write nothing at all.
+h = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
+                                enable_delay_s=60, disable_delay_s=180, buffer_soc=80,
+                                enable_threshold_w=300, disable_threshold_w=300,
+                                control_enabled=True))   # writes need the explicit release
+box_on_full = car(connected=True, charging=False, enabled=True, max_current=9)
+writes, last = [], None
+for i in range(10):
+    last = h.decide(site(pv=4000, grid=-2000, bat=0, soc=95), box_on_full,
+                    now=datetime(2026, 9, 12, 15, 0, 0) + timedelta(seconds=30 * i),
+                    session_kwh=0.0)
+    writes += h.hardware_actions(last, box_on_full)
+check("ten cycles with a plugged, idle car write no switching at all",
+      not any(w.startswith("alw=") for w in writes), writes)
+check("...the decision keeps asking for a charge to be allowed",
+      last.charge is True and last.target_current > 6.0, last.reason)
+check("...and no stop grace is ever entered", "waiting disable" not in last.reason, last.reason)
+
+print("the start grace waits on the wallbox and writes nothing while it waits")
+h = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
+                                enable_delay_s=60, disable_delay_s=180, buffer_soc=80,
+                                enable_threshold_w=0, disable_threshold_w=0,
+                                control_enabled=True))
+box_off = car(connected=True, charging=False, enabled=False)
+d1 = h.decide(site(pv=6000, grid=-2000, bat=0, soc=95), box_off,
+              now=datetime(2026, 9, 12, 16, 0, 0), session_kwh=0.0)
+w1 = h.hardware_actions(d1, box_off)
+check("nothing at all is written while the start is held back", w1 == [], w1)
+check("the decision reports the wait", d1.charge is False and "waiting enable delay" in d1.reason,
+      d1.reason)
+d2 = h.decide(site(pv=6000, grid=-2000, bat=0, soc=95), box_off,
+              now=datetime(2026, 9, 12, 16, 1, 1), session_kwh=0.0)
+w2 = h.hardware_actions(d2, box_off)
+check("after the grace the current limit goes first, then the enable",
+      len(w2) >= 2 and w2[0].startswith("amx=") and w2[-1] == "alw=1", w2)
+check("no stop is written anywhere in between", "alw=0" not in w1 + w2, w1 + w2)
+
+print("the stop grace holds first and writes exactly one stop afterwards")
+h = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
+                                enable_delay_s=0, disable_delay_s=180, buffer_soc=80,
+                                enable_threshold_w=0, disable_threshold_w=0,
+                                control_enabled=True))
+drawing = car(connected=True, charging=True, power=1400, enabled=True, max_current=6)
+drawing.phases = 1
+# SOC below the buffer on purpose: above it the house battery deliberately *carries*
+# the car at the minimum instead of stopping (its own rule), which would hide the grace.
+d1 = h.decide(site(pv=0, grid=600, bat=0, soc=70), drawing,
+              now=datetime(2026, 9, 12, 17, 0, 0), session_kwh=0.0)
+w1 = h.hardware_actions(d1, drawing)
+check("surplus 800 W while drawing: the charge is held, not cut",
+      d1.charge is True and "waiting disable" in d1.reason, d1.reason)
+check("...and nothing is written in the meantime", w1 == [], w1)
+d2 = h.decide(site(pv=0, grid=600, bat=0, soc=70), drawing,
+              now=datetime(2026, 9, 12, 17, 3, 1), session_kwh=0.0)
+w2 = h.hardware_actions(d2, drawing)
+check("after 180 s the decision stops - and exactly one alw=0 goes out",
+      d2.charge is False and w2 == ["alw=0"], "%s | %s" % (d2.reason, w2))
+
+print("the floor has 300 W of hysteresis, and it is asymmetric")
+# One phase, 6 A minimum: the floor is 1380 W. Starting demands 1680 W, holding only
+# 1080 W - so a surplus sitting on the floor neither opens nor ends a session, which is
+# what stops the start/stop/start pattern the safety counter had to catch.
+h = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
+                                enable_delay_s=0, disable_delay_s=0, buffer_soc=80,
+                                enable_threshold_w=300, disable_threshold_w=300))
+box_off = car(connected=True, charging=False, enabled=False)
+d = h.decide(site(pv=1400, grid=-1400, bat=0, soc=95), box_off,
+             now=datetime(2026, 9, 12, 18, 0, 0), session_kwh=0.0)
+check("1400 W is above the minimum but must not open a session (needs 1680 W)",
+      d.charge is False, d.reason)
+d = h.decide(site(pv=1700, grid=-1700, bat=0, soc=95), box_off,
+             now=datetime(2026, 9, 12, 18, 1, 0), session_kwh=0.0)
+check("1700 W does open one, at 7.4 A", d.charge is True and abs(d.target_current - 7.4) < 0.2,
+      d.reason)
+h2 = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
+                                 enable_delay_s=0, disable_delay_s=0, buffer_soc=80,
+                                 enable_threshold_w=300, disable_threshold_w=300))
+holding = car(connected=True, charging=True, power=1380, enabled=True, max_current=6)
+holding.phases = 1
+d = h2.decide(site(pv=0, grid=100, bat=0, soc=70), holding,
+              now=datetime(2026, 9, 12, 18, 2, 0), session_kwh=0.0)
+check("1280 W does not end a running charge (the hold floor is 1080 W)",
+      d.charge is True, d.reason)
+check("...it holds at the minimum instead of dropping to zero",
+      d.target_current == 6.0, "%.1f A" % d.target_current)
+d = h2.decide(site(pv=0, grid=600, bat=0, soc=70), holding,
+              now=datetime(2026, 9, 12, 18, 3, 0), session_kwh=0.0)
+check("800 W is below the hold floor, so the decision stops", d.charge is False, d.reason)
 
 print("\n%d passed, %d failed" % (TOTAL - len(FAILS), len(FAILS)))
 if FAILS:
