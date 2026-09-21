@@ -14,8 +14,11 @@ supply - while a start only puts it back. Current-limit changes (``amx=…``) ar
 switching and never count.
 
 The fault latches on purpose and does not clear when the counter decays: whatever produced
-the cycling may still be present, so releasing it is a human decision (the UI button, or a
-restart).
+the cycling may still be present, so releasing it is a human decision. Two actions count as
+one, by the owner's decision: the UI button, and a **service restart** - the counter lives in
+memory only, so a restart clears the fault by construction, and that is wanted (whoever
+restarts has looked at the cause first). What is *not* wanted is the opposite: that the latch
+releases itself while the app keeps running.
 
 Stdlib only and no I/O: the counting is pure, so it can be tested with injected times.
 """

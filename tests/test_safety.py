@@ -94,6 +94,20 @@ c.note("alw=1", T + 250)
 reason2 = c.note("alw=0", T + 260)            # 3 stops -> latch
 check("and the third stop latches again", reason2 is not None and c.fault, reason2)
 
+print("a restart clears the fault, by construction and by intent")
+c = SwitchCounter(threshold=2)
+c.note("alw=1", T)
+c.note("alw=0", T + 60)                       # 1 stop
+c.note("alw=1", T + 120)
+check("a running counter latches", c.note("alw=0", T + 180) is not None and c.fault)
+fresh = SwitchCounter(threshold=2)
+check("a freshly built counter - what a service restart gives - is clean",
+      not fresh.fault and fresh.count(T + 181) == 0)
+check("and it is deliberately not persisted: no save/load to restore the latch from",
+      not hasattr(fresh, "save") and not hasattr(fresh, "load"))
+check("the latch still never decays while the app runs (that is the half that matters)",
+      c.fault and c.count(T + DEFAULT_WINDOW_S + 500) == 0)
+
 print("the state published to the UI")
 c = SwitchCounter(threshold=5)
 c.note("alw=1", T)

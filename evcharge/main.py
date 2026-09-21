@@ -504,7 +504,9 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row"><span>surplus</span><span class="v" id="d_surplus">-</span></div>
   <div class="row"><span>reason</span><span class="v" id="d_reason">-</span></div>
   <div class="row" id="d_safety_row" style="display:none"><span>stops 30 min</span><span class="v" id="d_safety">-</span></div>
-  <button id="clearfault" style="display:none">Clear fault</button>
+  <button id="clearfault" style="display:none" title="Quittiert die Stoerung und gibt die
+    Wallbox wieder frei. Ein Neustart des Dienstes tut dasselbe - der Riegel lebt nur im
+    Speicher. Von selbst loest er sich nicht, solange die App laeuft.">Clear fault</button>
   <div class="row" id="d_cheap_row" style="display:none"><span>cheap window</span><span class="v" id="d_cheap">-</span></div>
   <div class="row" id="d_blocked_row" style="display:none"><span>blocked by</span><span class="v warn" id="d_blocked">-</span></div>
   <div class="row" id="d_grace_row" style="display:none"><span>grace</span><span class="v warn" id="d_grace">-</span></div>
