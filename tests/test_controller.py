@@ -586,6 +586,27 @@ d = h2.decide(site(pv=0, grid=600, bat=0, soc=70), holding,
               now=datetime(2026, 9, 12, 18, 3, 0), session_kwh=0.0)
 check("800 W is below the hold floor, so the decision stops", d.charge is False, d.reason)
 
+print("the owner's own margins: start +100 W, hold -300 W (21.09.2026)")
+# Stated in that order: 300/300 first, then "the start hysteresis may be less than 300 W,
+# make it 100". The asymmetry is deliberate - a late start gives away sun, a needless stop
+# ends a session - so these numbers are pinned instead of a tidy symmetric pair.
+h3 = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
+                                 enable_delay_s=0, disable_delay_s=0, buffer_soc=80,
+                                 enable_threshold_w=100, disable_threshold_w=300))
+box_off3 = car(connected=True, charging=False, enabled=False)
+d = h3.decide(site(pv=1400, grid=-1400, bat=0, soc=70), box_off3,
+              now=datetime(2026, 9, 21, 9, 0, 0), session_kwh=0.0)
+check("1400 W is above the minimum but below minimum+100 W -> no start", d.charge is False, d.reason)
+d = h3.decide(site(pv=1500, grid=-1500, bat=0, soc=70), box_off3,
+              now=datetime(2026, 9, 21, 9, 1, 0), session_kwh=0.0)
+check("1500 W is past the +100 W margin -> it starts", d.charge is True, d.reason)
+holding3 = car(connected=True, charging=True, power=1380, enabled=True, max_current=6)
+holding3.phases = 1
+d = h3.decide(site(pv=0, grid=100, bat=0, soc=70), holding3,
+              now=datetime(2026, 9, 21, 9, 2, 0), session_kwh=0.0)
+check("...and 1280 W holds a charge that is already running (down to -300 W)",
+      d.charge is True and d.target_current == 6.0, d.reason)
+
 print("\n%d passed, %d failed" % (TOTAL - len(FAILS), len(FAILS)))
 if FAILS:
     print("failed:", FAILS)

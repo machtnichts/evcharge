@@ -50,7 +50,7 @@
     "max_current": 14.0,
     "phases": 1,
     "voltage_nominal": 230.0,
-    "enable_threshold_w": 300.0,
+    "enable_threshold_w": 100.0,
     "disable_threshold_w": 300.0,
     "enable_delay_s": 60,
     "disable_delay_s": 180,
