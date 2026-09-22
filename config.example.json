@@ -79,7 +79,7 @@
     "timeout_s": 3,
     "csv": "logs/sdm_sessions.csv",
     "unplug_cycles": 2,
-    "entity_live": "sensor.sdm630_systemleistung",
+    "entity_live": "sensor.sdm630_l1_spannung",
     "stale_s": 600
   }
 }

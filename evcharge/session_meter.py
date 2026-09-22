@@ -60,8 +60,10 @@ class SessionMeter:
         self.now = now_fn
         # A slow counter does not change for hours and Home Assistant does not rewrite an
         # unchanged state, so the counter's own timestamp says nothing about whether the
-        # meter is still being read. Freshness therefore comes from a value that *moves*
-        # (the meter's power), handed in as `age_s` by the caller.
+        # meter is still being read. Freshness therefore comes from a value that *moves on
+        # every poll* - a phase voltage, whose jitter is always a new value. Do not use the
+        # meter's power or current for this: at night they sit at 0.00 W / 0.0 A, are never
+        # rewritten, and a perfectly healthy meter then looks dead.
         self.fresh = False
         self.stale_reads = 0
         self.import_kwh: Optional[float] = None     # last good meter readings

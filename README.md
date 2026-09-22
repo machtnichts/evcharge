@@ -72,9 +72,11 @@ feeds into, so the figure is the *meter's* view of the session and the PV share 
 deliberately **not** subtracted: import, export and net are all recorded, and a counter that
 drops (device reset) rebases the session instead of reporting a negative number.
 
-Freshness comes from the meter's power (`entity_live` in the `sdm` block): a counter that
-does not change is not re-written by Home Assistant, so its own timestamp says nothing about
-whether the meter is still being read. Stale readings make the session report "waiting"
+Freshness comes from a value that moves on every poll - a phase voltage (`entity_live` in the
+`sdm` block, default `sensor.sdm630_l1_spannung`). A counter that does not change is not
+re-written by Home Assistant, so its own timestamp says nothing about whether the meter is
+still being read - and neither does the meter's power or current, which sit at 0 at night and
+would make a perfectly healthy meter look dead. Stale readings make the session report "waiting"
 rather than a fabricated 0 kWh - and any session with a stale or late baseline says so in
 its CSV note.
 

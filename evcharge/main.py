@@ -153,10 +153,12 @@ class Service:
                          timeout=float(sd.get("timeout_s", 3.0))),
                 HaClient(str(sd.get("entity_export") or ""), env_file=env_file,
                          timeout=float(sd.get("timeout_s", 3.0))),
-                # The liveness probe: a counter that does not change is not re-written by
-                # Home Assistant, so its timestamp cannot tell whether the meter is still
-                # being read. The meter's *power* moves, so its age answers that.
-                HaClient(str(sd.get("entity_live") or "sensor.sdm630_systemleistung"),
+                # The liveness probe, and it must be a value that MOVES on every poll. Home
+                # Assistant does not re-write an unchanged state, so a counter (frozen while
+                # nothing is drawn) and even the *power* (0.00 W all night) sit untouched for
+                # hours and would look like a dead meter. A phase voltage jitters by a few
+                # tenths on every read - measured here: updated every ~15 s.
+                HaClient(str(sd.get("entity_live") or "sensor.sdm630_l1_spannung"),
                          env_file=env_file, timeout=float(sd.get("timeout_s", 3.0))),
             ]
             self.session_meter = SessionMeter(
