@@ -80,6 +80,8 @@
     "csv": "logs/sdm_sessions.csv",
     "unplug_cycles": 2,
     "entity_live": "sensor.sdm630_l1_spannung",
+    "entity_pv": "sensor.garage_pv_energie",
+    "entity_pv_power": "sensor.garage_pv_leistung",
     "stale_s": 600
   }
 }

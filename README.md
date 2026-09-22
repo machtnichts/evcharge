@@ -61,24 +61,40 @@ counter, MQTT framing, and a service smoke test that builds the app the way `mai
 * `manual` — handover: the app reads and reports, and writes nothing at all
 * `off`
 
-## Session energy, twice
+## Session energy, three times
 
-The wallbox's own session figure under-reads on this plant, so the app keeps a second one
-from the SDM630 in the garage (`evcharge/session_meter.py`): the meter's kWh counters are
-latched at plug-in, the difference is the running session, and on unplug it is frozen as
-"last session" and appended to `logs/sdm_sessions.csv` - one row per session, including the
-go-e figure for comparison. The SDM630 measures the garage feeder, which the garage PV also
-feeds into, so the figure is the *meter's* view of the session and the PV share is
-deliberately **not** subtracted: import, export and net are all recorded, and a counter that
-drops (device reset) rebases the session instead of reporting a negative number.
+The wallbox's own session figure under-reads on this plant, so the app keeps two more from the
+SDM630 in the garage (`evcharge/session_meter.py`): the meter's kWh counters are latched at
+plug-in, the difference is the running session, and on unplug it is frozen as "last session"
+and appended to `logs/sdm_sessions.csv` - one row per session, including the go-e figure for
+comparison. The SDM630 measures the garage feeder, which the garage PV also feeds into, so the
+meter's figure is `import - export` and the PV share is **not** silently subtracted: import,
+export and net are all recorded, and a counter that drops (device reset) rebases the session
+instead of reporting a negative number.
+
+The third figure is the meter's *corrected* one, closing the feeder's balance:
+
+    car = import - export + garage PV during the session
+
+so the plain SDM figure sits at the lower end and the corrected one above it. The correction
+comes from the inverter's own lifetime counter (`entity_pv`, default
+`sensor.garage_pv_energie`) and is only as good as that counter - measured on this plant about
+**8 % high** against the meter in a window where the branch demonstrably consumed nothing, and
+it reports **0.00 kWh** for minutes after every wake-up. Readings at or below zero, and any
+reading below the running maximum, are therefore refused and counted (`pv_artefacts`): taken
+as a *baseline*, that 0.00 would turn the next real reading into a ~279 kWh correction. If the
+counter never answers (its poller sleeps at night, when the PV is genuinely 0), the correction
+is 0 and the CSV row says so; if it wakes mid-session the baseline is latched late and the row
+calls the correction partial.
 
 Freshness comes from a value that moves on every poll - a phase voltage (`entity_live` in the
-`sdm` block, default `sensor.sdm630_l1_spannung`). A counter that does not change is not
-re-written by Home Assistant, so its own timestamp says nothing about whether the meter is
-still being read - and neither does the meter's power or current, which sit at 0 at night and
-would make a perfectly healthy meter look dead. Stale readings make the session report "waiting"
-rather than a fabricated 0 kWh - and any session with a stale or late baseline says so in
-its CSV note.
+`sdm` block, default `sensor.sdm630_l1_spannung`) and the inverter's power
+(`entity_pv_power`, default `sensor.garage_pv_leistung`). A counter that does not change is not
+re-written by Home Assistant, so its own timestamp says nothing about whether the meter or the
+inverter is still being read - and neither does the meter's power or current, which sit at 0 at
+night and would make a perfectly healthy meter look dead. Stale readings make the session
+report "waiting" rather than a fabricated 0 kWh - and any session with a stale or late baseline
+says so in its CSV note.
 
 ## Related repositories
 

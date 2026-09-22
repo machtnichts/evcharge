@@ -42,21 +42,27 @@ class Clock:
 
 
 class Meter:
-    """A fake SDM: two counters that only grow unless a test says otherwise."""
+    """A fake SDM: its two counters plus the inverter's, and none grows on its own."""
 
-    def __init__(self, imp=9297.60, exp=2529.21, age=12.0, ok=True):
+    def __init__(self, imp=9297.60, exp=2529.21, age=12.0, ok=True, pv=None, pv_age=25.0):
         self.imp, self.exp, self.age, self.ok = imp, exp, age, ok
+        # The garage PV's counter also lives in Home Assistant and is read through the same
+        # client, but it carries its own age: the inverter's poller sleeps at night.
+        self.pv, self.pv_age = pv, pv_age
         self.calls = 0
 
     def __call__(self):
         self.calls += 1
         if not self.ok:
             return None
-        return {"import_kwh": self.imp, "export_kwh": self.exp, "age_s": self.age}
+        return {"import_kwh": self.imp, "export_kwh": self.exp, "age_s": self.age,
+                "pv_energy_kwh": self.pv, "pv_age_s": self.pv_age}
 
-    def feed(self, imp_delta=0.0, exp_delta=0.0):
+    def feed(self, imp_delta=0.0, exp_delta=0.0, pv_delta=0.0):
         self.imp += imp_delta
         self.exp += exp_delta
+        if self.pv is not None:
+            self.pv += pv_delta
 
 
 def fresh(meter=None, clock=None, csv_path=None, **kw):
@@ -266,6 +272,117 @@ check("the state shape stays complete", {"enabled", "session", "last", "csv", "r
       sorted(st))
 check("the csv path is published so the owner knows where the rows land",
       st["csv"].endswith("sessions.csv"), st["csv"])
+
+print("the third figure: the meter's net corrected by the garage PV's own counter")
+# Afternoon case: the car draws 7.0 kWh while the PV feeds 2.5 kWh into the same feeder, so
+# the meter only sees 4.5 kWh of import. Corrected = 4.5 - 0 + 2.5 = 7.0 kWh.
+m13, meter13, clock13, path13 = fresh(meter=Meter(pv=279.56))
+m13.update(connected=False)
+m13.update(connected=True)
+check("the inverter's counter is latched as the session's PV baseline",
+      m13.session["base_pv"] == 279.56, m13.session["base_pv"])
+meter13.feed(imp_delta=4.5, pv_delta=2.5)
+clock13.tick(3600)
+m13.update(connected=True)
+fig = m13.as_state()["session"]
+check("the meter's own figure is the plain import", fig["import_kwh"] == 4.5, fig)
+check("the garage PV's share comes from its own counter", fig["pv_kwh"] == 2.5, fig)
+check("the corrected figure closes the balance", fig["corrected_kwh"] == 7.0, fig)
+check("and its source is named", fig["pv_source"] == "counter", fig)
+m13.update(connected=False)
+m13.update(connected=False)
+check("the finished row carries all three values",
+      m13.last["corrected_kwh"] == 7.0 and m13.last["pv_kwh"] == 2.5
+      and m13.last["goe_session_kwh"] == 0.0, m13.last)
+with open(path13, newline="") as fh:
+    rows13 = list(csv.reader(fh))
+check("the CSV header grew the three columns",
+      rows13[0][-3:] == ["garage_pv_kwh", "sdm_corrected_kwh", "pv_source"], rows13[0])
+check("...and the row is written in that order",
+      rows13[1][9] == "2.5" and rows13[1][10] == "7.0" and rows13[1][11] == "counter",
+      rows13[1])
+
+print("the inverter's 0.00 slip is ignored, not turned into energy")
+# Measured on the plant: the register reads 0.00 kWh for minutes after the logger wakes up
+# (poller journal 05:16:53), then the real 279.56. Taking that literally would invent a huge
+# negative correction; dropping it silently would freeze the figure without saying so.
+m14, meter14, clock14, path14 = fresh(meter=Meter(pv=279.56))
+m14.update(connected=False)
+m14.update(connected=True)
+meter14.feed(imp_delta=3.0, pv_delta=1.0)
+clock14.tick(1800)
+m14.update(connected=True)
+meter14.pv = 0.0                       # the logger woke up and lied
+m14.update(connected=True)
+fig = m14.as_state()["session"]
+check("a counter reading below the running maximum is dropped", fig["pv_kwh"] == 1.0, fig)
+check("...and counted, so a frozen correction stays visible",
+      m14.as_state()["pv_artefacts"] == 1, m14.as_state()["pv_artefacts"])
+meter14.pv = 280.6                     # the real register comes back
+m14.update(connected=True)
+check("a later, higher reading is accepted again",
+      m14.as_state()["session"]["pv_kwh"] == 1.04, m14.as_state()["session"])
+m14.update(connected=False)
+m14.update(connected=False)
+check("and the row says the slip happened", "reported 0.00" in (m14.last["note"] or ""), m14.last)
+
+print("a session without a counter reading says so instead of guessing")
+m15, meter15, clock15, path15 = fresh(meter=Meter(pv=None))     # logger asleep (night)
+m15.update(connected=False)
+m15.update(connected=True)
+meter15.feed(imp_delta=9.8)
+clock15.tick(7200)
+m15.update(connected=True)
+fig = m15.as_state()["session"]
+check("the correction falls back to zero",
+      fig["corrected_kwh"] == 9.8 and fig["pv_kwh"] is None, fig)
+check("the source says it was assumed", fig["pv_source"] == "assumed_zero", fig)
+check("...and that it is still waiting rather than measured", fig["pv_waiting"] is True, fig)
+check("a night session is then exactly the meter's figure",
+      fig["net_kwh"] == fig["corrected_kwh"], fig)
+m15.update(connected=False)
+m15.update(connected=False)
+check("and the row explains the assumption",
+      "correction taken as 0" in (m15.last["note"] or ""), m15.last)
+
+print("a stale counter is not treated as a still inverter")
+m16, meter16, clock16, path16 = fresh(meter=Meter(pv=279.56, pv_age=4000.0))
+m16.update(connected=False)
+m16.update(connected=True)
+meter16.feed(imp_delta=2.0, pv_delta=0.5)
+clock16.tick(600)
+m16.update(connected=True)
+fig = m16.as_state()["session"]
+check("an over-age counter reading is refused",
+      fig["pv_source"] == "assumed_zero" and fig["pv_waiting"] is True, fig)
+check("...and its age is published so the difference stays visible",
+      m16.as_state()["pv_age_s"] == 4000.0, m16.as_state()["pv_age_s"])
+check("...so the correction stays at zero and the state shows the staleness",
+      fig["corrected_kwh"] == 2.0 and m16.as_state()["pv_stale"] is True, fig)
+
+print("a 0.00 as the very first reading must not become the baseline")
+# The trap this guards: the register's post-wake 0.00 latched as the *baseline* would turn the
+# next real reading (279.56 kWh) into a ~279 kWh correction for a single session.
+m17, meter17, clock17, path17 = fresh(meter=Meter(pv=0.0))
+m17.update(connected=False)
+m17.update(connected=True)
+check("a zero reading is refused outright",
+      m17.session["base_pv"] is None, m17.session["base_pv"])
+check("...and counted as an artefact", m17.as_state()["pv_artefacts"] == 2,   # two cycles
+      m17.as_state()["pv_artefacts"])
+meter17.pv = 279.56                                     # the real register appears
+meter17.feed(imp_delta=5.0)
+clock17.tick(900)
+m17.update(connected=True)
+fig = m17.as_state()["session"]
+check("the real reading becomes the baseline, not a 279 kWh correction",
+      fig["pv_kwh"] == 0.0 and fig["corrected_kwh"] == 5.0, fig)
+check("and a baseline latched after plug-in is flagged as partial",
+      fig["pv_late"] is True, fig)
+m17.update(connected=False)
+m17.update(connected=False)
+check("...and the row says the correction covers only part of the session",
+      "latched late" in (m17.last["note"] or ""), m17.last)
 
 print()
 if FAILS:

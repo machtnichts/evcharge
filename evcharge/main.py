@@ -160,12 +160,25 @@ class Service:
                 # tenths on every read - measured here: updated every ~15 s.
                 HaClient(str(sd.get("entity_live") or "sensor.sdm630_l1_spannung"),
                          env_file=env_file, timeout=float(sd.get("timeout_s", 3.0))),
+                # The garage PV's own lifetime counter, for the third session figure (the
+                # meter's net plus what the inverter fed into the same feeder). Its poller
+                # sleeps at night, so an absent value here is normal, never an error.
+                HaClient(str(sd.get("entity_pv") or "sensor.garage_pv_energie"),
+                         env_file=env_file, timeout=float(sd.get("timeout_s", 3.0))),
+                # ...and the inverter's liveness probe, for the same reason the meter needs
+                # one: a *counter* is not rewritten while it does not move (measured here:
+                # 279.56 kWh sat untouched while the poller read it every 30 s), so its own
+                # timestamp is useless as a freshness check. The power reading moves on every
+                # poll, so it is the one that can go stale.
+                HaClient(str(sd.get("entity_pv_power") or "sensor.garage_pv_leistung"),
+                         env_file=env_file, timeout=float(sd.get("timeout_s", 3.0))),
             ]
             self.session_meter = SessionMeter(
                 read=self._sdm_counters,
                 csv_path=str(sd.get("csv") or "logs/sdm_sessions.csv"),
                 unplug_cycles=int(sd.get("unplug_cycles", 2)),
-                stale_s=float(sd.get("stale_s", 600)))
+                stale_s=float(sd.get("stale_s", 600)),
+                pv_enabled=bool(sd.get("entity_pv", True)))
         self.state: Dict = {
             "started_at": time.time(), "control_enabled": self.settings.control_enabled,
             "mode": self.settings.mode, "site": {}, "charger": {}, "decision": {},
@@ -226,6 +239,8 @@ class Service:
         imports = self._sdm_readers[0].get_state()
         exports = self._sdm_readers[1].get_state() if len(self._sdm_readers) > 1 else None
         live = self._sdm_readers[2].get_state() if len(self._sdm_readers) > 2 else None
+        pv = self._sdm_readers[3].get_state() if len(self._sdm_readers) > 3 else None
+        pv_live = self._sdm_readers[4].get_state() if len(self._sdm_readers) > 4 else None
         if imports is None or imports.get("value") is None:
             return None
         self._sdm_cache = {
@@ -234,6 +249,13 @@ class Service:
             # From the moving value, not from the counter (see the session meter's docstring).
             "age_s": (live or {}).get("age_s"),
             "counter_age_s": imports.get("age_s"),
+            # The inverter's counter, for the third session figure. It may be unavailable
+            # (its poller sleeps at night) or stale; the session meter decides what that
+            # means, this cache only reports what Home Assistant had. The age comes from the
+            # *power* entity: the counter is not rewritten while it stands still, so only the
+            # moving value can say whether the inverter is still being polled.
+            "pv_energy_kwh": (pv or {}).get("value"),
+            "pv_age_s": (pv_live or {}).get("age_s"),
         }
         return self._sdm_cache
 
@@ -609,6 +631,7 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row"><span>current / set</span><span class="v" id="c_amp">-</span></div>
   <div class="row"><span>session go-e</span><span class="v" id="c_sess">-</span></div>
   <div class="row"><span>session SDM</span><span class="v" id="c_sdm">-</span></div>
+  <div class="row"><span>session SDM+Deye</span><span class="v" id="c_sdm_corr">-</span></div>
   <div class="row"><span>last session SDM</span><span class="v" id="c_sdm_last">-</span></div>
   <div class="row"><span>temperatures</span><span class="v" id="c_temp">-</span></div>
   <div class="row"><span>cable phases</span><span class="v" id="c_phases">-</span></div>
@@ -718,13 +741,15 @@ async function load(){
    const sd=s.sdm||{}, ss=sd.session||null, sl=sd.last||null;
    const k=x=>(x===null||x===undefined)?"-":Number(x).toFixed(3);
    const el=document.getElementById("c_sdm"), le=document.getElementById("c_sdm_last");
+   const ce=document.getElementById("c_sdm_corr");
    // A frozen meter must be visible, not silently read as 0 kWh: the SDM630 is polled by Home
    // Assistant, and that polling can stop without anything here failing.
    const ageTxt=(sd.read_age_s===null||sd.read_age_s===undefined)?"unknown age"
      :(sd.read_age_s<3600?Math.round(sd.read_age_s)+" s":(sd.read_age_s/3600).toFixed(1)+" h");
    const staleTxt=sd.stale?(" | STALE: the meter has not been read for "+ageTxt
      +" - the SDM630 polling in Home Assistant is not running"):"";
-   if(!sd.enabled){ el.textContent="off"; el.title="SDM session meter disabled in config.json"; }
+   if(!sd.enabled){ el.textContent="off"; el.title="SDM session meter disabled in config.json";
+     ce.textContent="off"; ce.title="SDM session meter disabled in config.json"; }
    else if(ss){
      el.textContent=ss.waiting_for_meter?"waiting":k(ss.import_kwh)+" kWh";
      el.title="measured at the garage SDM630 | import since plug-in "+k(ss.import_kwh)+" kWh"
@@ -735,18 +760,40 @@ async function load(){
        +(ss.waiting_for_meter?" | WAITING for the first meter reading":"")
        +(ss.rebased?" | counter was reset "+ss.rebased+"x, energy before that kept":"")
        +(ss.relatched?" | baseline latched at process start":"")+staleTxt;
+     // The third figure the owner asked for: the meter's one plus the garage PV's own
+     // counter. It is the *upper* of the two SDM figures - car = import - export + garage PV
+     // - and only as good as that counter (measured ~8 % too high against the meter).
+     ce.textContent=ss.waiting_for_meter?"waiting":k(ss.corrected_kwh)+" kWh";
+     ce.title="SDM figure corrected by the garage PV | net "+k(ss.net_kwh)+" kWh + garage PV "
+       +k(ss.pv_kwh)+" kWh = "+k(ss.corrected_kwh)+" kWh"
+       +" | source: "+(ss.pv_source==="counter"
+         ?"the inverter's own counter (it reads ~8 % high against the meter)"
+         :(ss.pv_waiting
+           ?"no counter reading yet (its poller sleeps at night) - correction currently 0"
+           :"no counter reading (its poller sleeps at night, PV = 0) - correction taken as 0"))
+       +" | car = import - export + garage PV, so this sits above the plain SDM figure"
+       +(sd.pv_artefacts?(" | inverter counter reported 0.00 "+sd.pv_artefacts+"x, ignored"):"");
    }
    else{
      el.textContent=sd.stale?"stale":((sd.import_kwh===null)?"no reading":"0.000 kWh");
      el.title="no car session right now | SDM630 counters: import "+k(sd.import_kwh)
        +" kWh, export "+k(sd.export_kwh)+" kWh | meter reading "+ageTxt+" old"
        +(sd.read_failures?(" | "+sd.read_failures+" read failure(s)"):"")+staleTxt;
+     ce.textContent="-";
+     ce.title="no car session right now | garage PV counter: "
+       +((sd.pv_energy_kwh===null||sd.pv_energy_kwh===undefined)?"no reading"
+         :k(sd.pv_energy_kwh)+" kWh"+(sd.pv_age_s===null||sd.pv_age_s===undefined?"":" ("
+           +(sd.pv_age_s<3600?Math.round(sd.pv_age_s)+" s":(sd.pv_age_s/3600).toFixed(1)+" h")
+           +" old)"))
+       +(sd.pv_artefacts?(" | reported 0.00 "+sd.pv_artefacts+"x and was ignored"):"");
    }
    if(sl){
      le.textContent=k(sl.import_kwh)+" kWh";
      le.title="last finished session, measured at the SDM630 | import "+k(sl.import_kwh)+" kWh"
        +" | export "+k(sl.export_kwh)+" kWh | net "+k(sl.net_kwh)+" kWh"
        +" | "+k(sl.duration_h)+" h, "+sl.started+" to "+sl.ended
+       +" | corrected by the garage PV: "+k(sl.corrected_kwh)+" kWh (garage PV "
+       +k(sl.pv_kwh)+" kWh, source "+(sl.pv_source||"n/a")+")"
        +" | the wallbox's own session figure was "+k(sl.goe_session_kwh)+" kWh"
        +" | "+sd.rows+" row(s) in "+sd.csv+(sl.note?(" | "+sl.note):"");
    } else { le.textContent="-"; le.title="no finished session recorded yet ("+sd.csv+")"; }
