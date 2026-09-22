@@ -762,12 +762,14 @@ async function load(){
        +(ss.relatched?" | baseline latched at process start":"")+staleTxt;
      // The third figure the owner asked for: the meter's one plus the garage PV's own
      // counter. It is the *upper* of the two SDM figures - car = import - export + garage PV
-     // - and only as good as that counter (measured ~8 % too high against the meter).
+     // - and only as good as that counter, which may sit up to ~8 % above the meter's figure
+     // (an UPPER bound: the meter cannot count the branch's own standby loads, so its export
+     // counter under-reads by exactly what they eat - see the session meter's docstring).
      ce.textContent=ss.waiting_for_meter?"waiting":k(ss.corrected_kwh)+" kWh";
      ce.title="SDM figure corrected by the garage PV | net "+k(ss.net_kwh)+" kWh + garage PV "
        +k(ss.pv_kwh)+" kWh = "+k(ss.corrected_kwh)+" kWh"
        +" | source: "+(ss.pv_source==="counter"
-         ?"the inverter's own counter (it reads ~8 % high against the meter)"
+         ?"the inverter's own counter - it can sit up to ~8 % above what the meter counted, because the meter cannot count the branch's own standby loads"
          :(ss.pv_waiting
            ?"no counter reading yet (its poller sleeps at night) - correction currently 0"
            :"no counter reading (its poller sleeps at night, PV = 0) - correction taken as 0"))

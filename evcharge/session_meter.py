@@ -23,9 +23,13 @@ so `import - export` is the part the meter can prove (the lower reading) and add
 inverter's generation closes it. That sum is only as good as the inverter's counter, and
 this inverter's counter is *known* to be sloppy here:
 
-* measured 2026-09-22 in a window where the branch demonstrably consumed nothing (SDM import
-  0.000 kWh over 12 h): the inverter's own energy said 4.18 kWh while the meter saw 3.88 kWh
-  leave - **about 8 % too high**;
+* over 21.09.2026 05:00-17:00 UTC the inverter said 4.18 kWh while the meter saw 3.88 kWh leave
+  the branch: **at most 8 %**, and an upper bound rather than the inverter's error. That branch
+  permanently carries a router, the garage door and the wallbox's standby, and the meter cannot
+  *count* loads that small (start current 0.04 A = ~9 VA), so its export counter under-reads the
+  PV by exactly what they consume. The 0.30 kWh gap equals 25 W of permanent load over those
+  12 h, and the owner's own estimate (router ~10 W + wallbox standby ~5 W) already covers
+  0.18 kWh of it - the inverter's real error lies somewhere between ~0 % and +8 %;
 * and for the first minutes after every wake-up the register reads **0.00 kWh** (poller
   journal 05:16:53 `0.00 kWh`, four minutes later the real 279.56 kWh). On a lifetime counter
   that is an artefact, not a rollover: a reading below the running maximum is therefore

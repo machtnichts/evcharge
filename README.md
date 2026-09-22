@@ -78,9 +78,14 @@ The third figure is the meter's *corrected* one, closing the feeder's balance:
 
 so the plain SDM figure sits at the lower end and the corrected one above it. The correction
 comes from the inverter's own lifetime counter (`entity_pv`, default
-`sensor.garage_pv_energie`) and is only as good as that counter - measured on this plant about
-**8 % high** against the meter in a window where the branch demonstrably consumed nothing, and
-it reports **0.00 kWh** for minutes after every wake-up. Readings at or below zero, and any
+`sensor.garage_pv_energie`) and is only as good as that counter. Over one 12 h window the
+inverter said 4.18 kWh where the meter saw 3.88 kWh leave the branch - **at most 8 %, an upper
+bound rather than a measured error**: that branch permanently carries a router, the garage door
+and the wallbox's standby, and the meter cannot *count* loads that small (start current 0.04 A
+= ~9 VA), so its export counter under-reads the PV by exactly what they consume. The 0.30 kWh
+gap is 25 W of permanent load over those 12 h, and the owner's own estimate (router ~10 W +
+wallbox standby ~5 W) already covers 0.18 kWh of it. It also reports **0.00 kWh** for minutes
+after every wake-up. Readings at or below zero, and any
 reading below the running maximum, are therefore refused and counted (`pv_artefacts`): taken
 as a *baseline*, that 0.00 would turn the next real reading into a ~279 kWh correction. If the
 counter never answers (its poller sleeps at night, when the PV is genuinely 0), the correction
