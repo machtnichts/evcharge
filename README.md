@@ -61,6 +61,23 @@ counter, MQTT framing, and a service smoke test that builds the app the way `mai
 * `manual` — handover: the app reads and reports, and writes nothing at all
 * `off`
 
+## Session energy, twice
+
+The wallbox's own session figure under-reads on this plant, so the app keeps a second one
+from the SDM630 in the garage (`evcharge/session_meter.py`): the meter's kWh counters are
+latched at plug-in, the difference is the running session, and on unplug it is frozen as
+"last session" and appended to `logs/sdm_sessions.csv` - one row per session, including the
+go-e figure for comparison. The SDM630 measures the garage feeder, which the garage PV also
+feeds into, so the figure is the *meter's* view of the session and the PV share is
+deliberately **not** subtracted: import, export and net are all recorded, and a counter that
+drops (device reset) rebases the session instead of reporting a negative number.
+
+Freshness comes from the meter's power (`entity_live` in the `sdm` block): a counter that
+does not change is not re-written by Home Assistant, so its own timestamp says nothing about
+whether the meter is still being read. Stale readings make the session report "waiting"
+rather than a fabricated 0 kWh - and any session with a stale or late baseline says so in
+its CSV note.
+
 ## Related repositories
 
 * the Modbus proxy this app reads through (one session to the inverter, many readers)

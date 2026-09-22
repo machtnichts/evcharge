@@ -13,6 +13,9 @@ venv/
 *.log
 *.stdout
 
+# Recorded session history (live data, never part of the repository)
+logs/
+
 # Editor / OS
 .DS_Store
 *.swp

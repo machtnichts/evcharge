@@ -31,6 +31,7 @@ from .drivers.solaredge import SolarEdgeSite
 from .ha import HaClient
 from .proxy import ProxyStatusClient, summary as proxy_summary
 from .safety import SwitchCounter
+from .session_meter import SessionMeter
 
 LOG = logging.getLogger("evcharge")
 
@@ -133,11 +134,45 @@ class Service:
             self.garage = HaClient(str(gp.get("entity") or "sensor.garage_pv_leistung"),
                                    timeout=float(gp.get("timeout_s", 3.0)),
                                    env_file=(config.get("ha") or {}).get("env_file"))
+        # Session energy, measured a second time at the SDM630 in the garage (session_meter.py):
+        # the wallbox's own figure under-reads, so the owner wants his own number next to it,
+        # plus a CSV row for every finished session. Both counters are read on their own
+        # cadence - the meter may ask every cycle, the cache decides when Home Assistant is
+        # actually bothered.
+        sd = config.get("sdm") or {}
+        self.session_meter = None
+        self._sdm_every = max(5.0, float(sd.get("every_s", 30)))
+        self._sdm_at = 0.0
+        self._sdm_cache = None
+        self._sdm_readers = []
+        self._accum_at = 0.0             # for the go-e session integration (measured dt)
+        if sd.get("enabled"):
+            env_file = (config.get("ha") or {}).get("env_file")
+            self._sdm_readers = [
+                HaClient(str(sd.get("entity_import") or ""), env_file=env_file,
+                         timeout=float(sd.get("timeout_s", 3.0))),
+                HaClient(str(sd.get("entity_export") or ""), env_file=env_file,
+                         timeout=float(sd.get("timeout_s", 3.0))),
+                # The liveness probe: a counter that does not change is not re-written by
+                # Home Assistant, so its timestamp cannot tell whether the meter is still
+                # being read. The meter's *power* moves, so its age answers that.
+                HaClient(str(sd.get("entity_live") or "sensor.sdm630_systemleistung"),
+                         env_file=env_file, timeout=float(sd.get("timeout_s", 3.0))),
+            ]
+            self.session_meter = SessionMeter(
+                read=self._sdm_counters,
+                csv_path=str(sd.get("csv") or "logs/sdm_sessions.csv"),
+                unplug_cycles=int(sd.get("unplug_cycles", 2)),
+                stale_s=float(sd.get("stale_s", 600)))
         self.state: Dict = {
             "started_at": time.time(), "control_enabled": self.settings.control_enabled,
             "mode": self.settings.mode, "site": {}, "charger": {}, "decision": {},
             "garage": {},           # garage PV info row (HA value + its age), display only
+            "sdm": {},              # second session figure + the last one (SDM630)
             "actions": [], "errors": [], "cycles": 0, "last_cycle": None,
+            # Published from the first cycle on, so the UI and the MQTT discovery template
+            # never have to cope with the key being absent.
+            "session_kwh": 0.0,
             "mqtt_connected": False, "dry_run": not self.settings.control_enabled,
             "manual_since": None,   # epoch when manual mode was entered, else None
         }
@@ -172,6 +207,33 @@ class Service:
         if now - getattr(self, key, 0.0) >= HEARTBEAT_S:
             setattr(self, key, now)
             LOG.warning("%s read failed: %s", what, exc)
+
+    def _sdm_counters(self) -> Optional[Dict]:
+        """The SDM630 counters, refreshed on their own cadence and cached in between.
+
+        The session meter asks every cycle; Home Assistant is only bothered every `every_s`,
+        because the counters move slowly and HA is not a device this plant should hammer. A
+        failed refresh returns None, which the meter records as a reading failure - never as
+        energy.
+        """
+        if self._sdm_cache is not None and (time.time() - self._sdm_at) < self._sdm_every:
+            return self._sdm_cache
+        self._sdm_at = time.time()
+        if not self._sdm_readers:
+            return None
+        imports = self._sdm_readers[0].get_state()
+        exports = self._sdm_readers[1].get_state() if len(self._sdm_readers) > 1 else None
+        live = self._sdm_readers[2].get_state() if len(self._sdm_readers) > 2 else None
+        if imports is None or imports.get("value") is None:
+            return None
+        self._sdm_cache = {
+            "import_kwh": imports["value"],
+            "export_kwh": (exports or {}).get("value"),
+            # From the moving value, not from the counter (see the session meter's docstring).
+            "age_s": (live or {}).get("age_s"),
+            "counter_age_s": imports.get("age_s"),
+        }
+        return self._sdm_cache
 
     def _safety_force_on(self) -> None:
         """The safety action itself: leave the car charging steadily, then stop writing.
@@ -384,11 +446,30 @@ class Service:
             if charger_state is not None:
                 self.state["charger"] = {k: v for k, v in asdict(charger_state).items()
                                          if k != "raw"}
+            # The go-e session figure: integrated from the wallbox's own per-phase
+            # measurements over the *measured* cycle time. `interval_s` is the configured
+            # target, not what the loop actually took, so using it over-counts whenever the
+            # loop runs faster than the setting - and this figure is the one the owner
+            # compares his own meter against. Reset when the car goes away, so "session"
+            # means one plug-in; the SDM meter below freezes its own copy at the same edge.
+            now_ts = time.time()
+            dt_s = 0.0 if not self._accum_at else max(0.0, min(300.0, now_ts - self._accum_at))
+            self._accum_at = now_ts
+            if charger_state is not None and charger_state.charging:
+                self.state["session_kwh"] = self.state.get("session_kwh", 0.0) + \
+                    charger_state.power * (dt_s / 3600.0) / 1000.0
+            if not connected:
+                self.state["session_kwh"] = 0.0
             if decision is not None:
                 self.state["decision"] = asdict(decision)
-                if charger_state is not None and charger_state.charging:
-                    self.state["session_kwh"] = self.state.get("session_kwh", 0.0) + \
-                        charger_state.power * (self.config.get("interval_s", 5) / 3600.0) / 1000.0
+        # SDM session meter - the second, independent session figure (session_meter.py). Fed
+        # after the go-e one so the CSV keeps the session's final value, and deliberately
+        # outside the state lock: a slow Home Assistant read must not block the web UI.
+        if self.session_meter is not None and charger_state is not None:
+            self.session_meter.update(connected=connected,
+                                      goe_session_kwh=self.state.get("session_kwh", 0.0))
+            with self._lock:
+                self.state["sdm"] = self.session_meter.as_state()
         if self.mqtt is not None:
             try:
                 self.mqtt.publish_state(self.state)
@@ -524,7 +605,9 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row"><span>state</span><span class="v" id="c_state">-</span></div>
   <div class="row"><span>charging power</span><span class="v" id="c_power">-</span></div>
   <div class="row"><span>current / set</span><span class="v" id="c_amp">-</span></div>
-  <div class="row"><span>session</span><span class="v" id="c_sess">-</span></div>
+  <div class="row"><span>session go-e</span><span class="v" id="c_sess">-</span></div>
+  <div class="row"><span>session SDM</span><span class="v" id="c_sdm">-</span></div>
+  <div class="row"><span>last session SDM</span><span class="v" id="c_sdm_last">-</span></div>
   <div class="row"><span>temperatures</span><span class="v" id="c_temp">-</span></div>
   <div class="row"><span>cable phases</span><span class="v" id="c_phases">-</span></div>
  </div>
@@ -620,7 +703,52 @@ async function load(){
  document.getElementById("c_state").textContent=c.car_state||"-";
  document.getElementById("c_power").textContent=w(c.power);
  document.getElementById("c_amp").textContent=(c.currents&&c.currents[0]?c.currents[0].toFixed(1):"0")+" / "+c.max_current+" A";
- document.getElementById("c_sess").textContent=(s.session_kwh??0).toFixed(2)+" kWh";
+ document.getElementById("c_sess").textContent=(s.session_kwh??0).toFixed(3)+" kWh";
+ document.getElementById("c_sess").title="Integrated here from the wallbox's own per-phase "
+   +"measurements over the measured cycle time, reset at every plug-in. The go-e's own "
+   +"figures are on the card's tooltips; this is the number the SDM figure next to it is "
+   +"there to check.";
+ // Session energy, twice: the wallbox's own figure above, and the owner's own, measured at
+ // the SDM630 in the garage (session_meter.py). That figure is the *meter's* view - the
+ // garage PV feeds the same feeder and is deliberately not subtracted - so import, export
+ // and net are all shown, and every finished session lands in the CSV.
+ (function(){
+   const sd=s.sdm||{}, ss=sd.session||null, sl=sd.last||null;
+   const k=x=>(x===null||x===undefined)?"-":Number(x).toFixed(3);
+   const el=document.getElementById("c_sdm"), le=document.getElementById("c_sdm_last");
+   // A frozen meter must be visible, not silently read as 0 kWh: the SDM630 is polled by Home
+   // Assistant, and that polling can stop without anything here failing.
+   const ageTxt=(sd.read_age_s===null||sd.read_age_s===undefined)?"unknown age"
+     :(sd.read_age_s<3600?Math.round(sd.read_age_s)+" s":(sd.read_age_s/3600).toFixed(1)+" h");
+   const staleTxt=sd.stale?(" | STALE: the meter has not been read for "+ageTxt
+     +" - the SDM630 polling in Home Assistant is not running"):"";
+   if(!sd.enabled){ el.textContent="off"; el.title="SDM session meter disabled in config.json"; }
+   else if(ss){
+     el.textContent=ss.waiting_for_meter?"waiting":k(ss.import_kwh)+" kWh";
+     el.title="measured at the garage SDM630 | import since plug-in "+k(ss.import_kwh)+" kWh"
+       +" | export (garage PV) "+k(ss.export_kwh)+" kWh | net "+k(ss.net_kwh)+" kWh"
+       +" | running "+k(ss.duration_h)+" h since "+ss.started
+       +" | the garage PV feeds the same feeder and is deliberately NOT subtracted"
+       +" | meter reading "+(sd.read_age_s===null?"of unknown age":Math.round(sd.read_age_s)+" s old")
+       +(ss.waiting_for_meter?" | WAITING for the first meter reading":"")
+       +(ss.rebased?" | counter was reset "+ss.rebased+"x, energy before that kept":"")
+       +(ss.relatched?" | baseline latched at process start":"")+staleTxt;
+   }
+   else{
+     el.textContent=sd.stale?"stale":((sd.import_kwh===null)?"no reading":"0.000 kWh");
+     el.title="no car session right now | SDM630 counters: import "+k(sd.import_kwh)
+       +" kWh, export "+k(sd.export_kwh)+" kWh | meter reading "+ageTxt+" old"
+       +(sd.read_failures?(" | "+sd.read_failures+" read failure(s)"):"")+staleTxt;
+   }
+   if(sl){
+     le.textContent=k(sl.import_kwh)+" kWh";
+     le.title="last finished session, measured at the SDM630 | import "+k(sl.import_kwh)+" kWh"
+       +" | export "+k(sl.export_kwh)+" kWh | net "+k(sl.net_kwh)+" kWh"
+       +" | "+k(sl.duration_h)+" h, "+sl.started+" to "+sl.ended
+       +" | the wallbox's own session figure was "+k(sl.goe_session_kwh)+" kWh"
+       +" | "+sd.rows+" row(s) in "+sd.csv+(sl.note?(" | "+sl.note):"");
+   } else { le.textContent="-"; le.title="no finished session recorded yet ("+sd.csv+")"; }
+ })();
  document.getElementById("c_temp").textContent=(c.temperatures||[]).slice(0,4).map(x=>Math.round(x)+"C").join(" ");
  // Cable phases: the number every power threshold depends on, and whether it was
  // measured from current that actually flowed or is still the configured assumption.

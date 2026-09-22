@@ -70,5 +70,16 @@
     "plan_deadline": "",
     "site_stale_s": 600.0,
     "timezone": "Europe/Berlin"
+  },
+  "sdm": {
+    "enabled": true,
+    "entity_import": "sensor.sdm630_gesamt_import_kwh",
+    "entity_export": "sensor.sdm630_gesamt_export_kwh",
+    "every_s": 30,
+    "timeout_s": 3,
+    "csv": "logs/sdm_sessions.csv",
+    "unplug_cycles": 2,
+    "entity_live": "sensor.sdm630_systemleistung",
+    "stale_s": 600
   }
 }
