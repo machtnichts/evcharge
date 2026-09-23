@@ -30,6 +30,7 @@ from .drivers.goe import GoEClient
 from .drivers.solaredge import SolarEdgeSite
 from .ha import HaClient
 from .proxy import ProxyStatusClient, summary as proxy_summary
+from .pv_forecast import Plane, PvForecast, factor as pv_factor
 from .safety import SwitchCounter
 from .session_meter import SessionMeter
 
@@ -179,11 +180,42 @@ class Service:
                 unplug_cycles=int(sd.get("unplug_cycles", 2)),
                 stale_s=float(sd.get("stale_s", 600)),
                 pv_enabled=bool(sd.get("entity_pv", True)))
+        # Local PV forecast (pv_forecast.py). Step 1 of the owner's plan: display and log it,
+        # steer NOTHING with it - he wants to see whether a forecast is any good on his roof
+        # before it may move the priority. So nothing in this block reaches a decision; it
+        # integrates the day's measured yields (from the same site reading, over the measured
+        # cycle time) and keeps today's CSV row on disk, so a restart costs at most the write
+        # interval.
+        self._fc_cfg = config.get("forecast") or {}
+        self._fc_capacity = float((config.get("site") or {}).get("battery_capacity_kwh", 10.0))
+        self.forecast = None
+        self._fc_at = 0.0
+        self._fc_write_s = max(30.0, float(self._fc_cfg.get("write_s", 300)))
+        self._fc_written_at = 0.0
+        self._fc_day = ""
+        self._fc = self._fc_blank(self._fc_day)
+        if self._fc_cfg.get("enabled"):
+            settings_cfg = config.get("settings") or {}
+            planes = [Plane(float(p.get("kwp", 0.0)), float(p.get("azimuth", 0.0)),
+                            float(p.get("tilt", 25.0)))
+                      for p in (self._fc_cfg.get("planes") or config.get("planes") or [])]
+            self.forecast = PvForecast(
+                planes=planes,
+                lat=float(self._fc_cfg.get("lat", 0.0)),
+                lon=float(self._fc_cfg.get("lon", 0.0)),
+                pr=float(self._fc_cfg.get("pr", 0.85)),
+                tz=str(self._fc_cfg.get("timezone") or settings_cfg.get("timezone")
+                       or "Europe/Berlin"),
+                every_s=float(self._fc_cfg.get("every_s", 3600)),
+                cache_path=str(self._fc_cfg.get("cache") or "logs/pv_forecast.json"),
+                timeout=float(self._fc_cfg.get("timeout_s", 20)))
+            self._fc_load_today()
         self.state: Dict = {
             "started_at": time.time(), "control_enabled": self.settings.control_enabled,
             "mode": self.settings.mode, "site": {}, "charger": {}, "decision": {},
             "garage": {},           # garage PV info row (HA value + its age), display only
             "sdm": {},              # second session figure + the last one (SDM630)
+            "forecast": {},         # PV forecast + today's measured totals (display only)
             "actions": [], "errors": [], "cycles": 0, "last_cycle": None,
             # Published from the first cycle on, so the UI and the MQTT discovery template
             # never have to cope with the key being absent.
@@ -494,11 +526,177 @@ class Service:
                                       goe_session_kwh=self.state.get("session_kwh", 0.0))
             with self._lock:
                 self.state["sdm"] = self.session_meter.as_state()
+        # PV forecast (pv_forecast.py) - display and logging only, step 1 of the plan. Refresh
+        # on its own cadence, add this cycle to the day's totals, keep today's row on disk.
+        # Nothing in this block can reach a decision; if the internet is gone the module keeps
+        # the previous forecast and only flags it stale.
+        if self.forecast is not None:
+            self.forecast.update()
+            fc_ts = time.time()
+            fc_dt = 0.0 if not self._fc_at else max(0.0, min(300.0, fc_ts - self._fc_at))
+            self._fc_at = fc_ts
+            fday = self.forecast.hour_now[:10]
+            if fday != self._fc_day:
+                if self._fc_day:
+                    self._fc_flush(final=True)     # close yesterday, reset for today
+                self._fc_reset(fday)
+            # Only a *fresh* reading may be integrated: on non-due cycles `site_state` is the
+            # cached last one (fine - a zero-order hold), but if the inverter read has been
+            # failing, that cached value is old, and adding it would inflate the day's measured
+            # figure with energy that was never produced. The stale gate the decisions use
+            # applies to the evidence as well.
+            fresh = bool(self._site_ok_at) and \
+                (fc_ts - self._site_ok_at) <= float(self.settings.site_stale_s)
+            self._fc_integrate(site_state if fresh else None, fc_dt,
+                               car_w=(charger_state.power if charger_state is not None else 0.0))
+            if fc_ts - self._fc_written_at >= self._fc_write_s:
+                self._fc_flush(final=False)
+                self._fc_written_at = fc_ts
+            with self._lock:
+                self.state["forecast"] = self.forecast.as_state(
+                    measured_today_kwh=self._fc["ac_kwh"],
+                    soc=(site_state.battery_soc if site_state is not None else None),
+                    soc_target=self.settings.priority_soc,
+                    capacity_kwh=self._fc_capacity,
+                    house_rest_kwh=float(self._fc_cfg.get("house_reserve_kwh", 3.0)),
+                    margin=float(self._fc_cfg.get("margin", 1.3)))
         if self.mqtt is not None:
             try:
                 self.mqtt.publish_state(self.state)
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("mqtt publish failed: %s", exc)
+    # ---------------- PV forecast: the day's evidence (display only) ----------------
+    def _fc_blank(self, day: str) -> Dict:
+        return {"day": day, "ac_kwh": 0.0, "array_kwh": 0.0, "house_kwh": 0.0,
+                "car_kwh": 0.0, "charge_kwh": 0.0, "discharge_kwh": 0.0,
+                "soc_min": None, "soc_max": None, "samples": 0}
+
+    def _fc_reset(self, day: str) -> None:
+        self._fc_day, self._fc = day, self._fc_blank(day)
+
+    def _fc_integrate(self, site_state, dt_s: float, car_w: float = 0.0) -> None:
+        """Add one site reading to the day's totals. Pure bookkeeping - no decision reads it.
+
+        The resolution is whatever the app's own read cadence gives: with a car connected it
+        reads the inverter every cycle, with an empty driveway it throttles (that is the
+        owner's standing rule: no extra polling load on the inverter), so `samples` is written
+        into the row and the measured figure is to be read with that resolution in mind.
+        """
+        if site_state is None or dt_s <= 0.0:
+            return
+        d = self._fc
+        h = dt_s / 3600.0 / 1000.0                      # W * h -> kWh
+        ac = max(0.0, float(getattr(site_state, "inverter_ac_w", 0.0) or 0.0))
+        arr = max(0.0, float(getattr(site_state, "pv_power_w", 0.0) or 0.0))
+        grid = float(getattr(site_state, "grid_power_w", 0.0) or 0.0)      # + = import
+        batt = float(getattr(site_state, "battery_power_w", 0.0) or 0.0)   # + = discharge
+        d["ac_kwh"] += ac * h
+        d["array_kwh"] += arr * h
+        # Energy balance at the AC node: inverter + grid = house + car. The inverter's AC
+        # output already carries whatever the battery adds or takes (DC side), so the battery
+        # needs no term of its own here. Clamped at 0: a sign slip must not write negative
+        # consumption into the file.
+        d["house_kwh"] += max(0.0, ac + grid - float(car_w or 0.0)) * h
+        d["car_kwh"] += max(0.0, float(car_w or 0.0)) * h
+        if batt < 0.0:
+            d["charge_kwh"] += -batt * h
+        else:
+            d["discharge_kwh"] += batt * h
+        soc = getattr(site_state, "battery_soc", None)
+        if soc is not None:
+            soc = float(soc)
+            d["soc_min"] = soc if d["soc_min"] is None else min(d["soc_min"], soc)
+            d["soc_max"] = soc if d["soc_max"] is None else max(d["soc_max"], soc)
+        d["samples"] += 1
+
+    def _fc_row(self, final: bool):
+        """One row of evidence: forecast against measured, plus what house and battery did."""
+        if self.forecast is None or self.forecast.data is None or not self._fc_day:
+            return None
+        date = self._fc_day
+        upto = (date + "T23:59") if final else self.forecast.hour_now
+        d = self._fc
+        exp_sofar = self.forecast.data.until_kwh(date, upto)
+        exp_sofar_dc = self.forecast.data.until_kwh(date, upto, ac=False)
+        return {
+            "row": "final" if final else "partial", "date": date,
+            "forecast_day_kwh": round(self.forecast.data.day_kwh(date), 3),
+            "forecast_sofar_kwh": round(exp_sofar, 3),
+            "forecast_rest_kwh": round(self.forecast.data.remaining_kwh(date, upto), 3),
+            "measured_ac_kwh": round(d["ac_kwh"], 3),
+            "measured_array_kwh": round(d["array_kwh"], 3),
+            # AC against the AC estimate, array (DC side) against the DC estimate - the two
+            # factors answer different questions and must not be mixed.
+            "factor_ac": pv_factor(d["ac_kwh"], exp_sofar),
+            "factor_array": pv_factor(d["array_kwh"], exp_sofar_dc),
+            "house_kwh": round(d["house_kwh"], 3), "car_kwh": round(d["car_kwh"], 3),
+            "battery_charge_kwh": round(d["charge_kwh"], 3),
+            "battery_discharge_kwh": round(d["discharge_kwh"], 3),
+            "soc_min": d["soc_min"], "soc_max": d["soc_max"], "samples": d["samples"],
+            "fetches": self.forecast.fetches, "failures": self.forecast.failures,
+        }
+
+    def _fc_flush(self, final: bool) -> None:
+        row = self._fc_row(final)
+        if row is None:
+            return
+        # Today's row lives in its own file and is rewritten as it grows: a restart, or a look
+        # at the file at noon, never loses the day. Only the finished day is appended to the CSV.
+        path = os.path.expanduser(str(self._fc_cfg.get("today") or "logs/pv_forecast_today.json"))
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(row, fh, indent=1, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as exc:
+            LOG.warning("could not write %s: %s", path, exc)
+        if not final:
+            return
+        csv_path = os.path.expanduser(str(self._fc_cfg.get("csv") or "logs/pv_forecast.csv"))
+        try:
+            os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+            fresh = not os.path.exists(csv_path)
+            with open(csv_path, "a") as fh:
+                if fresh:
+                    fh.write(",".join(row.keys()) + "\n")
+                fh.write(",".join("" if v is None else str(v) for v in row.values()) + "\n")
+            LOG.info("PV day closed: forecast %.1f kWh | measured AC %.1f kWh (factor %s) | "
+                     "array %.1f kWh | house %.1f kWh | car %.1f kWh | battery +%.1f/-%.1f kWh | "
+                     "SOC %s..%s%% | %d samples",
+                     row["forecast_day_kwh"], row["measured_ac_kwh"], row["factor_ac"],
+                     row["measured_array_kwh"], row["house_kwh"], row["car_kwh"],
+                     row["battery_charge_kwh"], row["battery_discharge_kwh"],
+                     row["soc_min"], row["soc_max"], row["samples"])
+        except OSError as exc:
+            LOG.warning("could not append to %s: %s", csv_path, exc)
+
+    def _fc_load_today(self) -> None:
+        """Pick today's partial row back up after a restart (a leftover from yesterday is not
+        resumed - the new day starts clean)."""
+        try:
+            path = os.path.expanduser(
+                str(self._fc_cfg.get("today") or "logs/pv_forecast_today.json"))
+            if not os.path.exists(path):
+                return
+            with open(path) as fh:
+                row = json.load(fh)
+            day = self.forecast.hour_now[:10]
+            if str(row.get("date")) != day:
+                return
+            self._fc_day = day
+            self._fc = {"day": day, "ac_kwh": float(row.get("measured_ac_kwh") or 0.0),
+                        "array_kwh": float(row.get("measured_array_kwh") or 0.0),
+                        "house_kwh": float(row.get("house_kwh") or 0.0),
+                        "car_kwh": float(row.get("car_kwh") or 0.0),
+                        "charge_kwh": float(row.get("battery_charge_kwh") or 0.0),
+                        "discharge_kwh": float(row.get("battery_discharge_kwh") or 0.0),
+                        "soc_min": row.get("soc_min"), "soc_max": row.get("soc_max"),
+                        "samples": int(row.get("samples") or 0)}
+            LOG.info("today's PV row resumed from disk: %.2f kWh measured AC, %d samples",
+                     self._fc["ac_kwh"], self._fc["samples"])
+        except (OSError, ValueError, TypeError) as exc:
+            LOG.warning("could not read today's PV row: %s", exc)
 
     def update_settings(self, patch: Dict) -> Dict:
         allowed = set(asdict(Settings()).keys())
@@ -624,6 +822,11 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row" id="s_bat_row"><span>battery</span><span class="v" id="s_bat">-</span></div>
   <div class="row"><span>battery SOC</span><span class="v" id="s_soc">-</span></div>
   <div class="row"><span>imported / exported</span><span class="v" id="s_energy">-</span></div>
+  <div class="row" id="f_day_row" style="display:none" title="Lokale PV-Prognose fuer das Dach (Open-Meteo, 4 kWp Ost + 4 kWp West) - die Rest-Prognose fuer heute. Das wird noch NICHT gesteuert: die Zahl wird nur angezeigt und taeglich mitgeloggt, damit wir sehen, ob so eine Prognose fuer dieses Dach taugt.">
+    <span>PV forecast today</span><span class="v" id="f_day">-</span></div>
+  <div class="row" id="f_rest_row" style="display:none"><span>forecast rest of day</span><span class="v" id="f_rest">-</span></div>
+  <div class="row" id="f_factor_row" style="display:none"><span>factor today</span><span class="v" id="f_factor">-</span></div>
+  <div class="row" id="f_would_row" style="display:none"><span>rule would say</span><span class="v" id="f_would">-</span></div>
  </div>
  <div class="card"><h2>Vehicle</h2>
   <div class="row"><span>state</span><span class="v" id="c_state">-</span></div>
@@ -725,6 +928,49 @@ async function load(){
  document.getElementById("s_bat").textContent=(site.battery_power_w>0?"discharging ":"charging ")+w(Math.abs(site.battery_power_w||0));
  document.getElementById("s_soc").textContent=(site.battery_soc??0).toFixed(1)+" %";
  document.getElementById("s_energy").textContent=Math.round(site.grid_import_kwh??0)+" / "+Math.round(site.grid_export_kwh??0)+" kWh";
+ // PV forecast (pv_forecast.py). STEP 1: shown and logged, deliberately NOT wired into any
+ // decision - the owner wants to judge the forecast against his own roof first, so the row
+ // reports what the rule *would* say and nothing acts on it.
+ (function(){
+   const f=s.forecast||{}, ids=["f_day_row","f_rest_row","f_factor_row","f_would_row"];
+   ids.forEach(function(id){document.getElementById(id).style.display=f.enabled?"":"none";});
+   if(!f.enabled){return;}
+   const k=x=>(x===null||x===undefined)?"-":Number(x).toFixed(1)+" kWh";
+   const n2=x=>(x===null||x===undefined)?"-":Number(x).toFixed(2);
+   const day=document.getElementById("f_day"), rest=document.getElementById("f_rest"),
+         fac=document.getElementById("f_factor"), wld=document.getElementById("f_would");
+   const pl=(f.planes||[]).map(p=>p.kwp+" kWp @ "+p.azimuth+"deg/"+p.tilt+"deg").join(" + ");
+   const age=(f.age_min===null||f.age_min===undefined)?null:Number(f.age_min);
+   day.textContent=(f.today_kwh===undefined)?"keine Prognose":k(f.today_kwh);
+   day.title="Ganze Prognose fuer heute: "+k(f.today_kwh)+" AC (PR "+f.pr+")"
+     +" | bis jetzt erwartet: "+k(f.expected_so_far_kwh)
+     +" | gemessen (AC, integriert): "+k(f.measured_kwh)
+     +" | Quelle: Open-Meteo Stundensummen, "+pl
+     +(age===null?"":" | Prognose "+Math.round(age)+" min alt")
+     +(f.stale?" | STALE: letzte Aktualisierung fehlgeschlagen, es steht noch die alte Prognose":"")
+     +" | NUR ANZEIGE UND LOG, kein Steuereingriff";
+   rest.textContent=(f.remaining_kwh===undefined)?"-":(k(f.remaining_kwh)
+     +(f.remaining_corrected_kwh!==undefined?" ("+k(f.remaining_corrected_kwh)+" korr.)":""));
+   rest.title=(f.remaining_corrected_kwh!==undefined)
+     ?("Rest der Prognose fuer heute "+k(f.remaining_kwh)+", mit dem heutigen Faktor "+n2(f.factor_today)
+       +" auf "+k(f.remaining_corrected_kwh)+" korrigiert")
+     :("Rest der Prognose fuer heute "+k(f.remaining_kwh)+" - noch kein Faktor, weil zu wenig Tag vorbei ist");
+   fac.textContent=(f.factor_today===null||f.factor_today===undefined)?"noch keine Basis":n2(f.factor_today);
+   fac.title="gemessen heute / Prognose fuer genau dieses Fenster. Unter 0.3 kWh Prognose wird kein "
+     +"Faktor gebildet - das waere eine Division durch Rauschen (Vorlauf des Tages, truebe Stunden).";
+   if(f.would_be_text){
+     wld.textContent=f.would_be_text;
+     wld.className="v"+(f.would_be==="battery"?" warn":"");
+     wld.title="NUR ANZEIGE - diese Regel ist NICHT verdrahtet, es wird nichts geschaltet. "
+       +"Rechnung: Rest-Prognose korrigiert "+k(f.remaining_corrected_kwh)+" minus angenommener "
+       +"Hausverbrauch "+k(f.house_rest_kwh)+" = "+k(f.supply_after_house_kwh)+" gegen Akku-Bedarf "
+       +"("+f.soc_target+" % Ziel - "+n2(f.soc)+" % jetzt) x "+f.capacity_kwh+" kWh = "
+       +k(f.battery_need_kwh)+", mit Marge "+f.margin;
+   }else{
+     wld.textContent="-";
+     wld.title="noch keine Entscheidungsgrundlage (Prognose oder SOC fehlt)";
+   }
+ })();
  document.getElementById("c_state").textContent=c.car_state||"-";
  document.getElementById("c_power").textContent=w(c.power);
  document.getElementById("c_amp").textContent=(c.currents&&c.currents[0]?c.currents[0].toFixed(1):"0")+" / "+c.max_current+" A";

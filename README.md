@@ -61,6 +61,36 @@ counter, MQTT framing, and a service smoke test that builds the app the way `mai
 * `manual` — handover: the app reads and reports, and writes nothing at all
 * `off`
 
+## PV forecast (step 1: evidence, not control)
+
+The house battery fills by 10-11:00 in summer, and the only flexible consumer left is the car.
+Which of the two should get the surplus is a *weather* question, so the controller will need a
+forecast of the rest of the day. Step 1 - what is built here - **displays and logs that forecast
+and steers nothing**, because the owner wants to judge it against his own roof first.
+
+* `evcharge/pv_forecast.py`: Open-Meteo `global_tilted_irradiance` per roof plane (no key, one
+  request per plane per hour), `GTI x kWp` per hour = the DC estimate, `x PR` = the AC estimate.
+* Config block `forecast`: coordinates, planes (`kwp`/`azimuth`/`tilt`), `pr`, `every_s`,
+  `write_s`, `house_reserve_kwh`, `margin`, and the three file paths. With `enabled: false` the
+  module is not even constructed.
+* **The factor that makes it usable:** `measured today / predicted for exactly this window`,
+  which pulls a dull morning's forecast down with it. It needs a basis - below 0.05 kWh measured
+  there is no factor (the day has not started, and that is not an anomaly), and outside
+  0.25-1.60 it is refused with a warning. No factor means the planned rule falls back to its
+  sun-relative default instead of trusting a number.
+* **Evidence:** `logs/pv_forecast_today.json` (rewritten every `write_s`, resumed after a
+  restart) and one row per finished day in `logs/pv_forecast.csv`: forecast, both measured
+  figures (AC side and array side), both factors, house/car/battery energy, SOC range, and
+  `samples`. The measured figures are a zero-order hold of the app's own reads, so `samples` is
+  part of the record; a stale reading is never integrated.
+* The UI rows say "PV forecast today", "forecast rest of day", "factor today" and "rule would
+  say" - the last one is a *displayed* verdict that nothing acts on, with its inputs in the
+  tooltip so it cannot be mistaken for a decision.
+* **Pinned by tests** (`tests/test_pv_forecast.py`): the module has no actuator vocabulary and
+  `evcharge/controller.py` does not contain the word "forecast" at all. That is what makes "step
+  1 steers nothing" checkable rather than promised - and it stays that way until step 2 is
+  deliberately built.
+
 ## The inverter is read-only, provably
 
 The app reads the SolarEdge through the proxy and never writes to it: the house battery belongs

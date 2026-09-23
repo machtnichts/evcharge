@@ -71,6 +71,33 @@
     "site_stale_s": 600.0,
     "timezone": "Europe/Berlin"
   },
+  "forecast": {
+    "_comment": "Local PV forecast for the roof array (pv_forecast.py). STEP 1: display and daily logging only - nothing in the controller reads it, so it cannot move the priority. Coordinates and plane sizes are plant specific (the example values are a placeholder). 'house_reserve_kwh' is the assumed house demand for the rest of the day, used only for the displayed shadow verdict until a few logged days replace the guess.",
+    "enabled": true,
+    "lat": 0.0,
+    "lon": 0.0,
+    "planes": [
+      {
+        "kwp": 4.0,
+        "azimuth": -90,
+        "tilt": 25
+      },
+      {
+        "kwp": 4.0,
+        "azimuth": 90,
+        "tilt": 25
+      }
+    ],
+    "pr": 0.85,
+    "every_s": 3600,
+    "write_s": 300,
+    "timeout_s": 20,
+    "house_reserve_kwh": 3.0,
+    "margin": 1.3,
+    "cache": "logs/pv_forecast.json",
+    "today": "logs/pv_forecast_today.json",
+    "csv": "logs/pv_forecast.csv"
+  },
   "sdm": {
     "enabled": true,
     "entity_import": "sensor.sdm630_gesamt_import_kwh",
