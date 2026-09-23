@@ -83,6 +83,15 @@ and steers nothing**, because the owner wants to judge it against his own roof f
   figures (AC side and array side), both factors, house/car/battery energy, SOC range, and
   `samples`. The measured figures are a zero-order hold of the app's own reads, so `samples` is
   part of the record; a stale reading is never integrated.
+* **The day's production comes from the inverter's own counter**, not from an integral: SunSpec
+  model 101 `WH` sits inside the window this driver reads anyway, so it costs **no extra Modbus
+  traffic** (pinned by a test: still three reads, 103 registers). It is exact, it survives a
+  service outage, and it counts the battery's later discharge with it - which is what the
+  owner's monitoring app reports as production, and it is fair (energy into the battery is
+  counted once, when it comes out). Verified live: over the same 3.5 minutes the counter
+  advanced 0.0200 kWh and the app's AC integral advanced 0.0200 kWh. Compare the two as
+  **deltas over the same window**, never as totals right after a restart: the integral resumes
+  from the day's file, the counter's baseline only if the file has one.
 * The UI rows say "PV forecast today", "forecast rest of day", "factor today" and "rule would
   say" - the last one is a *displayed* verdict that nothing acts on, with its inputs in the
   tooltip so it cannot be mistaken for a decision.
