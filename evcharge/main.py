@@ -52,6 +52,18 @@ SITE_FAIL_BASE_S = 30.0
 SITE_FAIL_MAX_S = 600.0
 
 
+def day_delta(current: Optional[float], baseline: Optional[float]) -> Optional[float]:
+    """A day's production from a lifetime counter: how far it advanced since the day's baseline.
+
+    Returns None - never a negative number and never a fabricated zero - when an end is missing
+    or the counter went *backwards*. A reset, a wrap or a fresh register that reads 0 must be
+    visible as "no figure", not silently become a plausible-looking small number.
+    """
+    if current is None or baseline is None or current < baseline:
+        return None
+    return round(current - baseline, 3)
+
+
 def site_interval_s(connected: bool, failures: int) -> float:
     """Seconds to wait before reading the site again (pure, so it can be tested)."""
     base = SITE_ACTIVE_S if connected else SITE_IDLE_S
@@ -549,6 +561,9 @@ class Service:
                 (fc_ts - self._site_ok_at) <= float(self.settings.site_stale_s)
             self._fc_integrate(site_state if fresh else None, fc_dt,
                                car_w=(charger_state.power if charger_state is not None else 0.0))
+            # ...and the inverter's own counter for the day's production - the figure the
+            # forecast is actually scored against (see _fc_se_latch).
+            self._fc_se_latch(site_state if fresh else None)
             if fc_ts - self._fc_written_at >= self._fc_write_s:
                 self._fc_flush(final=False)
                 self._fc_written_at = fc_ts
@@ -560,6 +575,15 @@ class Service:
                     capacity_kwh=self._fc_capacity,
                     house_rest_kwh=float(self._fc_cfg.get("house_reserve_kwh", 3.0)),
                     margin=float(self._fc_cfg.get("margin", 1.3)))
+                # The inverter's own daily production, published next to the forecast: it is
+                # the reference the forecast has to beat, and it comes from the read window, so
+                # it costs no extra Modbus traffic at all.
+                self.state["forecast"].update({
+                    "se_today_kwh": self._fc["se_kwh"],
+                    "se_lifetime_kwh": (self._fc["se_end_kwh"] if self._fc["se_end_kwh"] is not None
+                                        else self._fc["se_start_kwh"]),
+                    "se_partial": bool(self._fc["se_partial"]),
+                })
         if self.mqtt is not None:
             try:
                 self.mqtt.publish_state(self.state)
@@ -569,7 +593,11 @@ class Service:
     def _fc_blank(self, day: str) -> Dict:
         return {"day": day, "ac_kwh": 0.0, "array_kwh": 0.0, "house_kwh": 0.0,
                 "car_kwh": 0.0, "charge_kwh": 0.0, "discharge_kwh": 0.0,
-                "soc_min": None, "soc_max": None, "samples": 0}
+                "soc_min": None, "soc_max": None, "samples": 0,
+                # The inverter's lifetime counter, and the baseline it had when this day
+                # started. Kept in the day's own record so a restart resumes the same day.
+                "se_start_kwh": None, "se_kwh": None, "se_partial": False,
+                "se_end_kwh": None}
 
     def _fc_reset(self, day: str) -> None:
         self._fc_day, self._fc = day, self._fc_blank(day)
@@ -609,6 +637,41 @@ class Service:
             d["soc_max"] = soc if d["soc_max"] is None else max(d["soc_max"], soc)
         d["samples"] += 1
 
+    def _fc_se_latch(self, site_state) -> None:
+        """Derive today's production from the inverter's lifetime AC counter.
+
+        This is the figure the owner's own app calls production, and it is exact: unlike the
+        integral below it cannot lose energy while the service is down, and it counts the
+        battery's later discharge too (fair - the counter measures what the inverter put out,
+        and energy that went into the battery is counted when it comes back out, once).
+
+        The baseline is latched on the first reading of a day and read back from the day's own
+        file after a restart, so a restart does not restart the day.
+        """
+        if site_state is None:
+            return
+        now = getattr(site_state, "inverter_energy_kwh", None)
+        if now is None:
+            return
+        d = self._fc
+        if d["se_start_kwh"] is None:
+            d["se_start_kwh"] = float(now)
+            # A baseline latched mid-day cannot describe a whole day - say so instead of
+            # publishing a figure that looks complete.
+            d["se_partial"] = bool(d["samples"] or d["ac_kwh"])
+            LOG.info("PV day baseline latched at %.3f kWh lifetime%s", float(now),
+                     " (partial day - the baseline was not taken at midnight)" if d["se_partial"] else "")
+            return
+        delta = day_delta(float(now), float(d["se_start_kwh"]))
+        if delta is None:
+            LOG.warning("the inverter's lifetime counter went backwards (%.3f -> %.3f) - the "
+                        "day's production cannot be derived from it, re-latching",
+                        float(d["se_start_kwh"]), float(now))
+            d["se_start_kwh"] = float(now)
+            return
+        d["se_kwh"] = delta
+        d["se_end_kwh"] = round(float(now), 3)
+
     def _fc_row(self, final: bool):
         """One row of evidence: forecast against measured, plus what house and battery did."""
         if self.forecast is None or self.forecast.data is None or not self._fc_day:
@@ -632,6 +695,11 @@ class Service:
             "house_kwh": round(d["house_kwh"], 3), "car_kwh": round(d["car_kwh"], 3),
             "battery_charge_kwh": round(d["charge_kwh"], 3),
             "battery_discharge_kwh": round(d["discharge_kwh"], 3),
+            # The inverter's own counter: what the owner's app calls production, exact and
+            # restart-proof. `partial` means the baseline was not taken at midnight.
+            "se_production_kwh": d["se_kwh"],
+            "se_partial": int(bool(d["se_partial"])),
+            "se_lifetime_start_kwh": d["se_start_kwh"], "se_lifetime_end_kwh": d["se_end_kwh"],
             "soc_min": d["soc_min"], "soc_max": d["soc_max"], "samples": d["samples"],
             "fetches": self.forecast.fetches, "failures": self.forecast.failures,
         }
@@ -692,7 +760,11 @@ class Service:
                         "charge_kwh": float(row.get("battery_charge_kwh") or 0.0),
                         "discharge_kwh": float(row.get("battery_discharge_kwh") or 0.0),
                         "soc_min": row.get("soc_min"), "soc_max": row.get("soc_max"),
-                        "samples": int(row.get("samples") or 0)}
+                        "samples": int(row.get("samples") or 0),
+                        "se_start_kwh": row.get("se_lifetime_start_kwh"),
+                        "se_kwh": row.get("se_production_kwh"),
+                        "se_end_kwh": row.get("se_lifetime_end_kwh"),
+                        "se_partial": bool(row.get("se_partial"))}
             LOG.info("today's PV row resumed from disk: %.2f kWh measured AC, %d samples",
                      self._fc["ac_kwh"], self._fc["samples"])
         except (OSError, ValueError, TypeError) as exc:
@@ -822,6 +894,7 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row" id="s_bat_row"><span>battery</span><span class="v" id="s_bat">-</span></div>
   <div class="row"><span>battery SOC</span><span class="v" id="s_soc">-</span></div>
   <div class="row"><span>imported / exported</span><span class="v" id="s_energy">-</span></div>
+  <div class="row" id="f_se_row" style="display:none" title="Der Lebensdauer-Zaehler des Wechselrichters (SunSpec WH) - genau die Zahl, die deine Monitoring-App als Produktion zeigt. Sie liegt im ohnehin gelesenen Registerfenster, kostet also keinen zusaetzlichen Modbus-Verkehr, und ist exakt: sie kann - anders als ein Integral aus Leistungsmessungen - nichts verlieren, waehrend der Dienst steht, und sie zaehlt die spaetere Akku-Entladung mit (fair: gezaehlt wird einmal, was der Wechselrichter abgegeben hat)."><span>PV produced today (counter)</span><span class="v" id="f_se">-</span></div>
   <div class="row" id="f_day_row" style="display:none" title="Lokale PV-Prognose fuer das Dach (Open-Meteo, 4 kWp Ost + 4 kWp West) - die Rest-Prognose fuer heute. Das wird noch NICHT gesteuert: die Zahl wird nur angezeigt und taeglich mitgeloggt, damit wir sehen, ob so eine Prognose fuer dieses Dach taugt.">
     <span>PV forecast today</span><span class="v" id="f_day">-</span></div>
   <div class="row" id="f_rest_row" style="display:none"><span>forecast rest of day</span><span class="v" id="f_rest">-</span></div>
@@ -933,6 +1006,22 @@ async function load(){
  // reports what the rule *would* say and nothing acts on it.
  (function(){
    const f=s.forecast||{}, ids=["f_day_row","f_rest_row","f_factor_row","f_would_row"];
+   // The inverter's counter row stands on its own: it works whether or not the forecast module
+   // is enabled, because it costs nothing extra (its register is in the window already).
+   const seRow=document.getElementById("f_se_row"), seVal=document.getElementById("f_se");
+   const hasSe=(f.se_lifetime_kwh!==null&&f.se_lifetime_kwh!==undefined);
+   seRow.style.display=hasSe?"":"none";
+   if(hasSe){
+     seVal.textContent=(f.se_today_kwh===null||f.se_today_kwh===undefined)
+       ?"Zaehler laeuft":(Number(f.se_today_kwh).toFixed(2)+" kWh")+(f.se_partial?" (Teil-Tag)":"");
+     seVal.title="Wechselrichter-Zaehler: heute "+((f.se_today_kwh===null||f.se_today_kwh===undefined)
+         ?"noch keine Differenz - der Tagesbeginn wird beim ersten Lesen verankert"
+         :Number(f.se_today_kwh).toFixed(3)+" kWh")
+       +" | Lebensdauer gesamt "+Number(f.se_lifetime_kwh).toLocaleString("de-DE")+" kWh"
+       +(f.se_partial?" | ACHTUNG Teil-Tag: die Verankerung lag nicht um Mitternacht, die Zahl deckt"
+         +" nur den Teil seit dem Dienststart ab":"")
+       +" | aus dem ohnehin gelesenen Registerfenster (kein zusaetzlicher Modbus-Verkehr)";
+   }
    ids.forEach(function(id){document.getElementById(id).style.display=f.enabled?"":"none";});
    if(!f.enabled){return;}
    const k=x=>(x===null||x===undefined)?"-":Number(x).toFixed(1)+" kWh";

@@ -40,6 +40,11 @@ INV_HDR, INV_DATA, INV_LEN = 40069, 40071, 50
 # Same here: three reads, each covering exactly what the decoder below touches, and no
 # read anywhere else. 103 registers per cycle in total.
 INV_START, INV_COUNT = 40071, 32          # ... through DC power at index 30
+# The inverter's lifetime AC energy (SunSpec model 101: WH as acc32 at offset 22, its scale
+# factor at 24) lives inside that same window, so a day's production figure costs no extra
+# Modbus traffic. Measured on this plant: 29,267.336 kWh with WH_SF 0, and the neighbouring
+# registers decode consistently (offset 12/13 = the AC power this driver already uses).
+INV_WH_OFF, INV_WH_SF_OFF = 22, 24
 METER_START, METER_COUNT = 40190, 53      # ... through M_Energy_W_SF at index 52
 V_BAT_POWER, V_BAT_SOC = 0xE174, 0xE184
 VENDOR_START, VENDOR_COUNT = 0xE174, 18   # battery power .. SOC in one window
@@ -79,6 +84,10 @@ class SiteState:
     battery_capacity_kwh: float = 10.0
     grid_import_kwh: Optional[float] = None
     grid_export_kwh: Optional[float] = None
+    # The inverter's own lifetime AC energy. The owner's monitoring app calls this production,
+    # and it is what a daily figure must be compared against - an integral of power samples is
+    # not, because it loses whatever happens while the app is not running.
+    inverter_energy_kwh: Optional[float] = None
     raw: Dict = field(default_factory=dict)
 
     @property
@@ -146,5 +155,11 @@ class SolarEdgeSite:
         imp, exp = acc32(meter[44], meter[45]), acc32(meter[36], meter[37])
         st.grid_import_kwh = round(imp * 10.0 ** (e_sf - 3), 3) if imp else None
         st.grid_export_kwh = round(exp * 10.0 ** (e_sf - 3), 3) if exp else None
+        # Lifetime AC energy, from the same window (SunSpec 101 WH, acc32 with its SF). A zero
+        # read is treated as no reading, not as 0 kWh - a register that briefly reads 0 after a
+        # power-up would otherwise look like a counter reset and poison every daily delta.
+        wh = acc32(inv[INV_WH_OFF], inv[INV_WH_OFF + 1])
+        wh_sf = s16(inv[INV_WH_SF_OFF])
+        st.inverter_energy_kwh = round(wh * 10.0 ** (wh_sf - 3), 3) if wh else None
         st.raw = {"meter": meter, "inverter": inv, "vendor": v, "bat": bat, "soc": soc}
         return st

@@ -19,7 +19,7 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evcharge.drivers.solaredge import SiteState                     # noqa: E402
-from evcharge.main import Service                                     # noqa: E402
+from evcharge.main import Service, day_delta                            # noqa: E402
 from evcharge.pv_forecast import (Forecast, Plane, PvForecast, build, factor, parse_hour,   # noqa: E402
                                   planes_kwp)
 
@@ -206,6 +206,36 @@ check("the final row is marked final", lines[1].split(",")[0] == "final", lines[
 check("a restart resumes today's partial row",
       (lambda: (setattr(stub, "_fc_day", ""), setattr(stub, "_fc", Service._fc_blank(stub, "")),
                 Service._fc_load_today(stub), stub._fc["ac_kwh"] == 4.0)[-1])())
+
+print("the inverter's own production figure: exact, and never fabricated")
+check("day_delta(): the advance since the day's baseline",
+      abs(day_delta(29267.336, 29240.1) - 27.236) < 0.001, str(day_delta(29267.336, 29240.1)))
+check("day_delta(): no baseline -> no figure", day_delta(29267.336, None) is None)
+check("day_delta(): no reading -> no figure", day_delta(None, 29240.1) is None)
+check("day_delta(): a counter that went backwards is not a small number",
+      day_delta(29240.1, 29267.336) is None)
+stub._fc_se_latch = lambda st: Service._fc_se_latch(stub, st)
+stub._fc = Service._fc_blank(stub, DAY)
+stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0))
+check("the baseline is latched on the first reading, with no figure yet",
+      stub._fc["se_start_kwh"] == 29240.0 and stub._fc["se_kwh"] is None
+      and stub._fc["se_partial"] is False)
+stub._fc_se_latch(SiteState(inverter_energy_kwh=29267.336))
+check("the next reading gives the day's production", stub._fc["se_kwh"] == 27.336,
+      str(stub._fc["se_kwh"]))
+check("...and remembers where the counter ended", stub._fc["se_end_kwh"] == 29267.336)
+stub._fc_se_latch(SiteState(inverter_energy_kwh=29200.0))
+check("a counter that jumps back keeps the last good figure and re-latches",
+      stub._fc["se_kwh"] == 27.336 and stub._fc["se_start_kwh"] == 29200.0)
+stub._fc_se_latch(SiteState(inverter_energy_kwh=None))
+check("a missing reading changes nothing", stub._fc["se_kwh"] == 27.336)
+check("the day's row carries it", Service._fc_row(stub, False)["se_production_kwh"] == 27.336)
+# A baseline taken in the middle of the day describes only part of it, and must say so.
+stub._fc = Service._fc_blank(stub, DAY)
+stub._fc["samples"] = 5
+stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0))
+check("a baseline latched mid-day is marked partial", stub._fc["se_partial"] is True)
+check("...and the row says so too", Service._fc_row(stub, False)["se_partial"] == 1)
 
 print("step 1's promise: this forecast cannot steer anything")
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

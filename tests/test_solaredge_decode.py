@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evcharge.drivers.solaredge import (  # noqa: E402
     SolarEdgeSite, METER_DATA, METER_LEN, INV_DATA, INV_LEN, V_BAT_POWER, V_BAT_SOC,
     INV_START, INV_COUNT, METER_START, METER_COUNT, VENDOR_START, VENDOR_COUNT,
-    BAT_OFF, SOC_OFF,
+    BAT_OFF, SOC_OFF, INV_WH_OFF, INV_WH_SF_OFF,
 )
 
 FAILS = []
@@ -62,7 +62,8 @@ class FakeClient:
         pass
 
 
-def site_with(grid_reg_w=0.0, dc_w=0.0, battery_reg_w=0.0, soc=50.0, w_sf=0):
+def site_with(grid_reg_w=0.0, dc_w=0.0, battery_reg_w=0.0, soc=50.0, w_sf=0,
+              lifetime_wh=0, lifetime_sf=0):
     """A site whose registers say exactly what we tell them to.
 
     Canned blocks are laid out the way the wire carries them now - three small windows
@@ -77,6 +78,10 @@ def site_with(grid_reg_w=0.0, dc_w=0.0, battery_reg_w=0.0, soc=50.0, w_sf=0):
     inv[12] = u16(int(round(0 / 10.0 ** 0)))                # inverter AC output
     inv[30] = u16(0)                                        # DC SF
     inv[29] = u16(int(round(dc_w)))                         # DC bus power
+    # Lifetime AC energy (SunSpec 101 WH): acc32 high word first, then its scale factor.
+    inv[INV_WH_OFF] = u16((lifetime_wh >> 16) & 0xFFFF)
+    inv[INV_WH_OFF + 1] = u16(lifetime_wh & 0xFFFF)
+    inv[INV_WH_SF_OFF] = u16(lifetime_sf)
 
     vendor = [0] * VENDOR_COUNT
     vendor[BAT_OFF:BAT_OFF + 2] = reg_words(battery_reg_w)
@@ -151,6 +156,23 @@ check("total registers per cycle stay near the reference pattern (76 there, 103 
 check("no read touches the unused span between the models (40111..40189)",
       not any(start <= 40189 and start + count > 40111 for start, count in reads),
       str(reads))
+
+print("lifetime AC energy: the inverter's own production counter, from the window we read anyway")
+# The vector is a live reading of this plant, taken before the decode existed here.
+st = site_with(lifetime_wh=29267336, lifetime_sf=0).read()
+check("WH 29267336 with SF 0 -> 29267.336 kWh", abs(st.inverter_energy_kwh - 29267.336) < 0.001,
+      "got %s" % st.inverter_energy_kwh)
+st = site_with(lifetime_wh=2926734, lifetime_sf=1).read()
+check("the scale factor is applied (SF 1 => a count is a tenth of a kWh)",
+      abs(st.inverter_energy_kwh - 29267.34) < 0.01, "got %s" % st.inverter_energy_kwh)
+st = site_with(lifetime_wh=0).read()
+check("a zero register is 'no reading', never 0.0 kWh", st.inverter_energy_kwh is None,
+      "got %r" % (st.inverter_energy_kwh,))
+_site = site_with(lifetime_wh=29267336)
+_site.read()
+check("it stays at three window reads - the counter costs no extra Modbus traffic",
+      len(_site.client.reads) == 3 and sum(c for _, c in _site.client.reads) == 103,
+      str(_site.client.reads))
 
 print("the driver is read-only: no path from this app into the inverter")
 # The owner's rule (\"Ich will nicht Akku steuern\") is a property of the code, so it is
