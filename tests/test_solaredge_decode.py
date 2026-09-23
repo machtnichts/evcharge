@@ -162,10 +162,11 @@ from evcharge.drivers.modbus import ModbusClient  # noqa: E402
 from evcharge.drivers import solaredge as se_mod  # noqa: E402
 
 modbus_writers = [n for n in dir(ModbusClient) if "write" in n.lower()]
-check("the Modbus client exposes no write method at all", modbus_writers == [], modbus_writers)
+check("the Modbus client exposes no write method at all", modbus_writers == [],
+      str(modbus_writers))
 steering = [n for n in dir(se_mod.SolarEdgeSite)
             if n.startswith("set_") or "battery_mode" in n or "discharge_limit" in n]
-check("the site driver exposes nothing that steers the battery", steering == [], steering)
+check("the site driver exposes nothing that steers the battery", steering == [], str(steering))
 check("...and its read window count is unchanged (103 registers per cycle)",
       sum(count for _, count in reads) == 103, str(sum(count for _, count in reads)))
 
