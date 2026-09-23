@@ -968,7 +968,8 @@ async function load(){
        +k(f.battery_need_kwh)+", mit Marge "+f.margin;
    }else{
      wld.textContent="-";
-     wld.title="noch keine Entscheidungsgrundlage (Prognose oder SOC fehlt)";
+     wld.title="noch keine Entscheidungsgrundlage: es fehlt der Tages-Faktor (zu wenig Messung "
+      +"bisher), die Rest-Prognose oder der SOC";
    }
  })();
  document.getElementById("c_state").textContent=c.car_state||"-";
