@@ -61,6 +61,20 @@ counter, MQTT framing, and a service smoke test that builds the app the way `mai
 * `manual` — handover: the app reads and reports, and writes nothing at all
 * `off`
 
+## The inverter is read-only, provably
+
+The app reads the SolarEdge through the proxy and never writes to it: the house battery belongs
+to the inverter, and the owner's rule is that this app does not steer it ("Ich will nicht Akku
+steuern"). So the Modbus client has no write method at all and the site driver has nothing that
+touches the storage registers - both were removed, and `tests/test_solaredge_decode.py` pins it
+structurally: no write method on the client, nothing battery-steering on the driver, and the
+control/limit register addresses must not reappear in the code.
+
+The live canary is the proxy's own counter: `upstream_writes` must stay 0, and the proxy card
+turns any value above 0 into a *bad* status ("PROXY WROTE TO THE DEVICE"). Measured: 0 writes
+across 59k poll cycles. The only device this app writes to is the **wallbox** (current limit,
+enable, neutral), and only through the single write chokepoint.
+
 ## Session energy, three times
 
 The wallbox's own session figure under-reads on this plant, so the app keeps two more from the

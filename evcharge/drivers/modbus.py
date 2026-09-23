@@ -1,4 +1,11 @@
-"""Minimal Modbus/TCP client (FC3/FC4 read, FC6/FC16 write). Stdlib only."""
+"""Minimal Modbus/TCP client - **read-only** (FC3/FC4), stdlib only.
+
+The write primitives (FC6/FC16) were removed on purpose: this client serves the
+inverter, and the app must never write to it (the battery belongs to the inverter,
+and the owner's rule is that nothing here steers it). With no write method on the
+class, "this app cannot write to the inverter" is a property a reader can check in
+one glance - and `tests/test_solaredge_decode.py` checks it for them.
+"""
 from __future__ import annotations
 
 import socket
@@ -19,7 +26,7 @@ class ModbusClient:
         self._sock: Optional[socket.socket] = None
         self._lock = threading.Lock()
         self._tid = 0
-        self.stats = {"reads": 0, "writes": 0, "errors": 0, "reconnects": 0}
+        self.stats = {"reads": 0, "errors": 0, "reconnects": 0}
 
     def _connect(self) -> None:
         if self._sock is not None:
@@ -86,19 +93,3 @@ class ModbusClient:
                 self.stats["reads"] += 1
                 return list(struct.unpack(">%dH" % count, body[2:2 + body[1]]))
         return self._retry(once)
-
-    def write_single(self, address: int, value: int) -> None:
-        def once() -> None:
-            with self._lock:
-                self._txn(struct.pack(">BHH", 6, address, value & 0xFFFF))
-                self.stats["writes"] += 1
-        self._retry(once)
-
-    def write_multiple(self, address: int, values: List[int]) -> None:
-        def once() -> None:
-            with self._lock:
-                payload = struct.pack(">%dH" % len(values), *[v & 0xFFFF for v in values])
-                pdu = struct.pack(">BHHB", 16, address, len(values), len(payload)) + payload
-                self._txn(pdu)
-                self.stats["writes"] += 1
-        self._retry(once)

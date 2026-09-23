@@ -152,6 +152,28 @@ check("no read touches the unused span between the models (40111..40189)",
       not any(start <= 40189 and start + count > 40111 for start, count in reads),
       str(reads))
 
+print("the driver is read-only: no path from this app into the inverter")
+# The owner's rule (\"Ich will nicht Akku steuern\") is a property of the code, so it is
+# pinned here structurally: the Modbus client has no write method, the site driver has
+# nothing that steers the battery, and the control/limit register addresses must not
+# reappear in the *code* (the module docstring may name them, to explain why they are gone).
+import inspect  # noqa: E402
+from evcharge.drivers.modbus import ModbusClient  # noqa: E402
+from evcharge.drivers import solaredge as se_mod  # noqa: E402
+
+modbus_writers = [n for n in dir(ModbusClient) if "write" in n.lower()]
+check("the Modbus client exposes no write method at all", modbus_writers == [], modbus_writers)
+steering = [n for n in dir(se_mod.SolarEdgeSite)
+            if n.startswith("set_") or "battery_mode" in n or "discharge_limit" in n]
+check("the site driver exposes nothing that steers the battery", steering == [], steering)
+check("...and its read window count is unchanged (103 registers per cycle)",
+      sum(count for _, count in reads) == 103, str(sum(count for _, count in reads)))
+
+body = inspect.getsource(se_mod).split('"""', 2)[-1]      # code without the module docstring
+for banned in ("write_single", "write_multiple", "V_CTRL", "V_EXPORT",
+               "0xE00D", "0xE010", "0xE000", "0xE001", "0xE002"):
+    check("...and %-12s does not appear in the driver code" % banned, banned not in body)
+
 print()
 if FAILS:
     print("%d FAILED: %s" % (len(FAILS), ", ".join(FAILS)))

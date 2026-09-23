@@ -1,7 +1,23 @@
 """SolarEdge site driver - reads through the local muxproxy (never the inverter).
 
 The proxy is the single Modbus client for the inverter; this driver just reads
-cached registers from it. Signed power convention used here:
+cached registers from it. **It is read-only, deliberately and provably:**
+
+* the inverter owns the house battery, and the owner's rule is that this app must
+  not touch it ("Ich will nicht Akku steuern") - so the battery-control calls that
+  once sat here (storage mode 0xE00D, discharge limit 0xE010) and the export-limit
+  constants (0xE000..0xE002) are gone, together with the Modbus write primitives;
+* `tests/test_solaredge_decode.py` pins that structurally - no write method on the
+  client, and the control register addresses must not appear in this source again;
+* the live canary is the proxy's own counter: `upstream_writes` must stay 0, and
+  `proxy.classify()` turns any value above 0 into a *bad* card ("PROXY WROTE TO THE
+  DEVICE"). Three days and 59k poll cycles of this plant: 0 writes.
+
+If a future version ever needs to steer the battery, that is a deliberate feature -
+with a watchdog that can never leave the storage in a special mode - not a helper
+left lying in a driver.
+
+Signed power convention used here:
 
     pv_power_w      >= 0   production
     grid_power_w    >0 import, <0 export      (convention used throughout this app)
@@ -27,8 +43,6 @@ INV_START, INV_COUNT = 40071, 32          # ... through DC power at index 30
 METER_START, METER_COUNT = 40190, 53      # ... through M_Energy_W_SF at index 52
 V_BAT_POWER, V_BAT_SOC = 0xE174, 0xE184
 VENDOR_START, VENDOR_COUNT = 0xE174, 18   # battery power .. SOC in one window
-V_CTRL_MODE, V_CTRL_DISCHARGE = 0xE00D, 0xE010
-V_EXPORT_MODE, V_EXPORT_LIMIT_MODE, V_EXPORT_LIMIT_W = 0xE000, 0xE001, 0xE002
 BAT_OFF = V_BAT_POWER - VENDOR_START      # 0
 SOC_OFF = V_BAT_SOC - VENDOR_START        # 16
 
@@ -134,13 +148,3 @@ class SolarEdgeSite:
         st.grid_export_kwh = round(exp * 10.0 ** (e_sf - 3), 3) if exp else None
         st.raw = {"meter": meter, "inverter": inv, "vendor": v, "bat": bat, "soc": soc}
         return st
-
-    # ---- battery control (optional, used by 'battery hold' strategy) -------
-    def set_battery_discharge_limit(self, watts: float) -> None:
-        regs = struct.pack(">f", float(watts))
-        high, low = struct.unpack(">HH", regs)
-        self.client.write_multiple(V_CTRL_DISCHARGE, [low, high])   # word-swapped
-
-    def set_battery_mode(self, mode: int) -> None:
-        """7 = maximize self-consumption, 3 = charge from PV+AC, 0 = off."""
-        self.client.write_single(V_CTRL_MODE, int(mode))
