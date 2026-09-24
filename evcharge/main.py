@@ -559,11 +559,13 @@ class Service:
             # applies to the evidence as well.
             fresh = bool(self._site_ok_at) and \
                 (fc_ts - self._site_ok_at) <= float(self.settings.site_stale_s)
+            # The inverter's counter first, then the integration: _fc_se_latch decides whether a
+            # baseline was taken at the day's start by looking at whether this day already has
+            # energy in it, so it must run BEFORE the cycle's own sample is added. (The other way
+            # round the day's flag was always "partial" - a check that could never pass.)
+            self._fc_se_latch(site_state if fresh else None)
             self._fc_integrate(site_state if fresh else None, fc_dt,
                                car_w=(charger_state.power if charger_state is not None else 0.0))
-            # ...and the inverter's own counter for the day's production - the figure the
-            # forecast is actually scored against (see _fc_se_latch).
-            self._fc_se_latch(site_state if fresh else None)
             if fc_ts - self._fc_written_at >= self._fc_write_s:
                 self._fc_flush(final=False)
                 self._fc_written_at = fc_ts
@@ -637,7 +639,7 @@ class Service:
             d["soc_max"] = soc if d["soc_max"] is None else max(d["soc_max"], soc)
         d["samples"] += 1
 
-    def _fc_se_latch(self, site_state) -> None:
+    def _fc_se_latch(self, site_state, minutes_since_midnight: Optional[int] = None) -> None:
         """Derive today's production from the inverter's lifetime AC counter.
 
         This is the figure the owner's own app calls production, and it is exact: unlike the
@@ -657,10 +659,18 @@ class Service:
         if d["se_start_kwh"] is None:
             d["se_start_kwh"] = float(now)
             # A baseline latched mid-day cannot describe a whole day - say so instead of
-            # publishing a figure that looks complete.
-            d["se_partial"] = bool(d["samples"] or d["ac_kwh"])
+            # publishing a figure that looks complete. Two independent signals, and it must be
+            # called before this cycle's own sample is added, or the first one is always true:
+            # energy already in the day (a restart, a late deploy), and the clock (a start well
+            # after midnight). An unknown clock counts as "not at the start" - a false warning
+            # is cheap, a missing one is not.
+            if minutes_since_midnight is None:
+                minutes_since_midnight = self._minutes_since_midnight()
+            d["se_partial"] = bool(d["samples"] or d["ac_kwh"]) or \
+                (minutes_since_midnight is None or minutes_since_midnight > 30)
             LOG.info("PV day baseline latched at %.3f kWh lifetime%s", float(now),
-                     " (partial day - the baseline was not taken at midnight)" if d["se_partial"] else "")
+                     " (partial day - the baseline was not taken at the day's start)"
+                     if d["se_partial"] else "")
             return
         delta = day_delta(float(now), float(d["se_start_kwh"]))
         if delta is None:
@@ -769,6 +779,17 @@ class Service:
                      self._fc["ac_kwh"], self._fc["samples"])
         except (OSError, ValueError, TypeError) as exc:
             LOG.warning("could not read today's PV row: %s", exc)
+
+    def _minutes_since_midnight(self) -> Optional[int]:
+        """Local minutes since midnight in the house's zone, or None if the zone is unusable."""
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            n = datetime.now(ZoneInfo(str(self.settings.timezone or "Europe/Berlin")))
+            return n.hour * 60 + n.minute
+        except Exception as exc:  # noqa: BLE001 - an unknown zone must not stop the app
+            LOG.warning("cannot resolve the house time zone for the day's baseline: %s", exc)
+            return None
 
     def update_settings(self, patch: Dict) -> Dict:
         allowed = set(asdict(Settings()).keys())

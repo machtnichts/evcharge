@@ -236,6 +236,21 @@ stub._fc["samples"] = 5
 stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0))
 check("a baseline latched mid-day is marked partial", stub._fc["se_partial"] is True)
 check("...and the row says so too", Service._fc_row(stub, False)["se_partial"] == 1)
+# ...but a baseline taken at the day's start is not, even with the clock as the only witness:
+# this is what the cycle order has to guarantee, because the flag is read from the day's own
+# energy - and a version that ran after the cycle's sample could never report "complete".
+stub._fc = Service._fc_blank(stub, DAY)
+stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0), minutes_since_midnight=3)
+check("a baseline taken at the day's start is complete", stub._fc["se_partial"] is False,
+      str(stub._fc["se_partial"]))
+stub._fc = Service._fc_blank(stub, DAY)
+stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0), minutes_since_midnight=420)
+check("a baseline taken later in the day is partial (the clock alone is enough)",
+      stub._fc["se_partial"] is True)
+stub._fc = Service._fc_blank(stub, DAY)
+stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0), minutes_since_midnight=None)
+check("an unknown clock is treated as 'not at the start' (a false warning is cheap)",
+      stub._fc["se_partial"] is True)
 
 print("step 1's promise: this forecast cannot steer anything")
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
