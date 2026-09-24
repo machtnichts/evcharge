@@ -225,8 +225,15 @@ class Service:
                        or "Europe/Berlin"),
                 every_s=float(self._fc_cfg.get("every_s", 3600)),
                 cache_path=str(self._fc_cfg.get("cache") or "logs/pv_forecast.json"),
-                timeout=float(self._fc_cfg.get("timeout_s", 20)))
+                timeout=float(self._fc_cfg.get("timeout_s", 20)),
+                alt_enabled=bool(self._fc_cfg.get("alt_enabled", True)))
             self._fc_load_today()
+        # The hourly record (see _fh_append): one cumulative line per hour, so the question
+        # "does the morning's forecast error carry into the afternoon?" can be answered from
+        # this plant's own data instead of from a proxy.
+        self._fh_last = ""
+        if self.forecast is not None:
+            self._fh_load_last()
         self.state: Dict = {
             "started_at": time.time(), "control_enabled": self.settings.control_enabled,
             "mode": self.settings.mode, "site": {}, "charger": {}, "decision": {},
@@ -571,6 +578,11 @@ class Service:
             self._fc_se_latch(site_state if fresh else None)
             self._fc_integrate(site_state if fresh else None, fc_dt,
                                car_w=(charger_state.power if charger_state is not None else 0.0))
+            # The hourly record: whenever the local hour turns over, write where the day stands.
+            fh_hour = self.forecast.hour_now
+            if fh_hour != self._fh_last:
+                self._fh_append(fh_hour)
+                self._fh_last = fh_hour
             if fc_ts - self._fc_written_at >= self._fc_write_s:
                 self._fc_flush(final=False)
                 self._fc_written_at = fc_ts
@@ -715,6 +727,10 @@ class Service:
             "se_production_kwh": d["se_kwh"],
             "se_partial": int(bool(d["se_partial"])),
             "se_lifetime_start_kwh": d["se_start_kwh"], "se_lifetime_end_kwh": d["se_end_kwh"],
+            # What the sky was doing, and what the other model said - so a day's factor can be
+            # explained later instead of being taken on faith.
+            "cloud_cover_pct": (self.forecast.data.clouds(date) if self.forecast.data else None),
+            "alt_forecast_day_kwh": self.forecast.alt_day_kwh,
             "soc_min": d["soc_min"], "soc_max": d["soc_max"], "samples": d["samples"],
             "fetches": self.forecast.fetches, "failures": self.forecast.failures,
         }
@@ -784,6 +800,51 @@ class Service:
                      self._fc["ac_kwh"], self._fc["samples"])
         except (OSError, ValueError, TypeError) as exc:
             LOG.warning("could not read today's PV row: %s", exc)
+
+    def _fh_append(self, hour: str) -> None:
+        """One cumulative line per local hour: production, the app's own integral, and what the
+        forecast expected by then. The FIRST end-to-end test of the rule's core assumption needs
+        exactly this - whether the morning's shortfall against the forecast carries into the
+        afternoon - and it can only be answered from the plant's own hourly record, which is why
+        the file exists before the rule does."""
+        if self.forecast is None or self.forecast.data is None or not self._fc_day:
+            return
+        date = self._fc_day
+        try:
+            expected = self.forecast.data.until_kwh(date, hour)
+        except Exception:  # noqa: BLE001
+            return
+        path = os.path.expanduser(str(self._fc_cfg.get("hourly") or "logs/pv_hourly.csv"))
+        row = {"date": date, "hour": hour, "se_kwh": self._fc["se_kwh"],
+               "ac_kwh": round(self._fc["ac_kwh"], 3), "expected_kwh": round(expected, 3),
+               "forecast_day_kwh": round(self.forecast.data.day_kwh(date), 3),
+               "cloud_cover_pct": self.forecast.data.clouds(date),
+               "alt_forecast_day_kwh": self.forecast.alt_day_kwh}
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            fresh = not os.path.exists(path)
+            with open(path, "a") as fh:
+                if fresh:
+                    fh.write(",".join(row.keys()) + "\n")
+                fh.write(",".join("" if v is None else str(v) for v in row.values()) + "\n")
+        except OSError as exc:
+            LOG.warning("could not append to %s: %s", path, exc)
+
+    def _fh_load_last(self) -> None:
+        """Remember which hour the record ends with, so a restart inside the same hour does not
+        write the hour twice (the analysis takes differences between lines)."""
+        try:
+            path = os.path.expanduser(str(self._fc_cfg.get("hourly") or "logs/pv_hourly.csv"))
+            if not os.path.exists(path):
+                return
+            with open(path) as fh:
+                last = [ln for ln in fh.read().splitlines() if ln and not ln.startswith("date,")]
+            if last:
+                parts = last[-1].split(",")
+                if len(parts) > 1 and parts[0] == self.forecast.hour_now[:10]:
+                    self._fh_last = parts[1]
+        except OSError as exc:
+            LOG.warning("could not read the hourly record: %s", exc)
 
     def _minutes_since_midnight(self) -> Optional[int]:
         """Local minutes since midnight in the house's zone, or None if the zone is unusable."""

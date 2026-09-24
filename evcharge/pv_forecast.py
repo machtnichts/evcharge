@@ -41,6 +41,9 @@ from typing import Callable, Dict, List, Optional
 LOG = logging.getLogger("evcharge.forecast")
 
 API = "https://api.open-meteo.com/v1/forecast"
+# The second opinion. A different model, also keyless, and deliberately only for the day total:
+# if the two disagree, the truth tomorrow decides which one to believe.
+ALT_API = "https://api.forecast.solar"
 # Sane bounds for the correction: a factor outside this came from a broken measurement or a
 # broken forecast, and applying it would do more harm than ignoring it.
 FACTOR_MIN, FACTOR_MAX = 0.25, 1.60
@@ -64,7 +67,15 @@ class Forecast:
     fetched_at: float = 0.0
     dc_wh: Dict[str, float] = field(default_factory=dict)   # ideal array output per hour
     ac_wh: Dict[str, float] = field(default_factory=dict)   # after the performance ratio
+    cloud_pct: Dict[str, float] = field(default_factory=dict)   # cloud cover per hour, %
     source: str = ""
+
+    def clouds(self, date: str, h0: int = 7, h1: int = 19) -> Optional[float]:
+        """Mean cloud cover over the day's productive hours - the number that explains why a
+        day came out at 0.73 or 1.02 instead of being a separate mystery."""
+        vals = [v for k, v in self.cloud_pct.items()
+                if k.startswith(date) and h0 <= int(k[11:13]) < h1]
+        return round(sum(vals) / len(vals), 1) if vals else None
 
     def _sum(self, series: Dict[str, float], date: str, upto: Optional[str] = None) -> float:
         total = 0.0
@@ -99,19 +110,35 @@ def parse_hour(iso: str) -> str:
     return iso[:13] + ":00"
 
 
-def build(data: dict, planes: List[Plane], pr: float) -> Forecast:
+def build(data: dict, planes: List[Plane], pr: float, clouds: Optional[Dict[str, float]] = None) -> Forecast:
     """Turn one Open-Meteo answer into hourly Wh for the whole array. Pure."""
     h = (data or {}).get("hourly") or {}
     times = h.get("time") or []
     gti = h.get("global_tilted_irradiance") or []
     if len(times) != len(gti):
         raise ValueError("hourly arrays differ in length (%d vs %d)" % (len(times), len(gti)))
+    cc = h.get("cloud_cover") or []
     out = Forecast(source="open-meteo")
-    for t, v in zip(times, gti):
+    for i, (t, v) in enumerate(zip(times, gti)):
         k = parse_hour(t)
         out.dc_wh[k] = float(v or 0.0) * planes_kwp(planes)      # Wh: W/m2 * kWp
         out.ac_wh[k] = out.dc_wh[k] * pr
+        if i < len(cc) and cc[i] is not None:
+            out.cloud_pct[k] = float(cc[i])
+    if clouds:
+        out.cloud_pct = clouds
     return out
+
+
+def parse_alt(data: dict, day: str) -> Optional[float]:
+    """forecast.solar's day total in kWh for one plane, or None if it did not answer for that
+    day - the second opinion must never look like a number when it is not there."""
+    try:
+        wh = (data or {}).get("result", {}).get("watt_hours_day", {}) or {}
+        val = wh.get(day)
+        return None if val is None else round(float(val) / 1000.0, 3)
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def planes_kwp(planes: List[Plane]) -> float:
@@ -147,11 +174,13 @@ class PvForecast:
                  cache_path: str = "logs/pv_forecast.json", timeout: float = 20.0,
                  enabled: bool = True, fetcher: Optional[Callable[[str], dict]] = None,
                  now_fn: Callable[[], float] = time.time,
-                 local_now: Optional[Callable[[], str]] = None):
+                 local_now: Optional[Callable[[], str]] = None,
+                 alt_enabled: bool = True):
         self.planes, self.lat, self.lon, self.pr = planes, lat, lon, pr
         self.tz, self.every_s, self.timeout = tz, max(60.0, float(every_s)), timeout
         self.cache_path = cache_path
         self.enabled = bool(enabled)
+        self.alt_enabled = bool(alt_enabled)
         self._fetch = fetcher or self._http
         self.now = now_fn
         self._local_now = local_now or self._zone_now
@@ -162,6 +191,12 @@ class PvForecast:
         self.last_error = ""
         self.stale = True
         self._warned = False
+        # The second opinion (forecast.solar, a different model, also keyless). Kept in its own
+        # corner: it must never be able to break the forecast the app already has.
+        self.alt_day_kwh: Optional[float] = None
+        self.alt_fetched_at = 0.0
+        self.alt_error = ""
+        self._alt_warned = False
         self._load_cache()
 
     # -- time ------------------------------------------------------------
@@ -178,12 +213,45 @@ class PvForecast:
         return self._local_now()
 
     # -- network ---------------------------------------------------------
-    def _url(self, plane: Plane) -> str:
+    def _url(self, plane: Plane, clouds: bool = False) -> str:
+        hourly = "global_tilted_irradiance,cloud_cover" if clouds else "global_tilted_irradiance"
         q = {"latitude": "%.4f" % self.lat, "longitude": "%.4f" % self.lon,
-             "hourly": "global_tilted_irradiance", "tilt": "%d" % int(plane.tilt),
+             "hourly": hourly, "tilt": "%d" % int(plane.tilt),
              "azimuth": "%d" % int(plane.azimuth), "past_days": "1", "forecast_days": "2",
              "timezone": self.tz}
         return API + "?" + urllib.parse.urlencode(q)
+
+    def _alt_url(self, plane: Plane) -> str:
+        return "%s/estimate/%.4f/%.4f/%d/%d/%s?resolution=60" % (
+            ALT_API, self.lat, self.lon, int(plane.tilt), int(plane.azimuth), plane.kwp)
+
+    def _fetch_alt(self, day: str) -> None:
+        """Ask forecast.solar for the same day, and keep the answer strictly separate: a second
+        opinion that can break the first one is worse than no second opinion."""
+        total = 0.0
+        for plane in self.planes:
+            answer = parse_alt(self._fetch(self._alt_url(plane)), day)
+            if answer is None:
+                raise ValueError("no day total for %s" % day)
+            total += answer
+        self.alt_day_kwh = round(total, 3)
+        self.alt_fetched_at = self.now()
+        self.alt_error = ""
+        self._alt_warned = False
+        LOG.info("second opinion (forecast.solar) for %s: %.2f kWh", day, self.alt_day_kwh)
+
+    def _fetch_alt_quietly(self, day: str) -> None:
+        if not self.alt_enabled:
+            return
+        if self.alt_day_kwh is not None and (self.now() - self.alt_fetched_at) < self.every_s:
+            return
+        try:
+            self._fetch_alt(day)
+        except Exception as exc:  # noqa: BLE001 - never let the second opinion break the first
+            self.alt_error = "%s: %s" % (type(exc).__name__, exc)
+            if not self._alt_warned:
+                self._alt_warned = True
+                LOG.warning("second opinion (forecast.solar) unavailable: %s", exc)
 
     def _http(self, url: str) -> dict:
         req = urllib.request.Request(url, headers={"User-Agent": "evcharge/1.0"})
@@ -194,18 +262,23 @@ class PvForecast:
         """Refresh when the cadence says so. Any failure keeps the previous data."""
         if not self.enabled:
             return
+        day = self.hour_now[:10]
         if not force and self.data is not None and (self.now() - self.fetched_at) < self.every_s:
             self.stale = self._hours_old() > 3.0
+            self._fetch_alt_quietly(day)          # own cadence, independent of the primary
             return
         merged = Forecast(source="open-meteo")
         try:
-            for plane in self.planes:
+            for idx, plane in enumerate(self.planes):
                 # build() with this plane's own kWp and the PR: dc = GTI x kWp, ac = x PR
-                answer = build(self._fetch(self._url(plane)), [plane], self.pr)
+                answer = build(self._fetch(self._url(plane, clouds=(idx == 0))), [plane], self.pr)
                 for k, wh in answer.dc_wh.items():
                     merged.dc_wh[k] = merged.dc_wh.get(k, 0.0) + wh
                 for k, wh in answer.ac_wh.items():
                     merged.ac_wh[k] = merged.ac_wh.get(k, 0.0) + wh
+                if idx == 0:
+                    # Cloud cover describes the place, not a plane - one request is enough.
+                    merged.cloud_pct = dict(answer.cloud_pct)
         except Exception as exc:  # noqa: BLE001 - the app must never wait on the internet
             self.failures += 1
             self.last_error = "%s: %s" % (type(exc).__name__, exc)
@@ -225,6 +298,7 @@ class PvForecast:
         LOG.info("PV forecast updated: today %.1f kWh, rest of today %.1f kWh",
                  merged.day_kwh(self.hour_now[:10]),
                  merged.remaining_kwh(self.hour_now[:10], self.hour_now))
+        self._fetch_alt_quietly(day)
 
     def _hours_old(self) -> float:
         return 0.0 if not self.fetched_at else (self.now() - self.fetched_at) / 3600.0
@@ -282,6 +356,11 @@ class PvForecast:
         out["today_kwh"] = round(self.data.day_kwh(date), 2)
         out["expected_so_far_kwh"] = round(self.data.until_kwh(date, hour), 2)
         out["remaining_kwh"] = round(self.data.remaining_kwh(date, hour), 2)
+        out["cloud_cover_pct"] = self.data.clouds(date)
+        out["alt_today_kwh"] = self.alt_day_kwh
+        out["alt_error"] = self.alt_error
+        out["alt_age_min"] = (None if not self.alt_fetched_at
+                              else round((self.now() - self.alt_fetched_at) / 60.0, 1))
         out["measured_kwh"] = None if measured_today_kwh is None else round(measured_today_kwh, 2)
         out["factor_today"] = factor(measured_today_kwh, out["expected_so_far_kwh"])
         if out["factor_today"] is not None and self.data is not None:

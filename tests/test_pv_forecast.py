@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evcharge.drivers.solaredge import SiteState                     # noqa: E402
 from evcharge.main import Service, day_delta                            # noqa: E402
-from evcharge.pv_forecast import (Forecast, Plane, PvForecast, build, factor, parse_hour,   # noqa: E402
-                                  planes_kwp)
+from evcharge.pv_forecast import (Forecast, Plane, PvForecast, build, factor, parse_alt,   # noqa: E402
+                                  parse_hour, planes_kwp)
 
 FAILS = []
 
@@ -96,24 +96,42 @@ check("factor(): ...and the refusal is not silent", factor(0.1, 9.0) is None)
 print("PvForecast: fetching, merging the planes, and never breaking the cycle")
 with tempfile.TemporaryDirectory() as tmp:
     calls: list = []
-    two_planes = {"azimuth=-90": series(DAY, {12: 400.0}), "azimuth=90": series(DAY, {12: 400.0})}
+    two_planes = {"azimuth=-90": series(DAY, {12: 400.0}), "azimuth=90": series(DAY, {12: 400.0}),
+                  # the second opinion answers per plane with a day total in Wh
+                  "/-90/4.0?": {"result": {"watt_hours_day": {DAY: 5690}}},
+                  "/90/4.0?": {"result": {"watt_hours_day": {DAY: 7651}}}}
     clock = [1_000_000.0]
     fc = PvForecast(planes=[Plane(4.0, -90), Plane(4.0, 90)], lat=49.12, lon=8.40, pr=0.85,
                     every_s=3600, cache_path=os.path.join(tmp, "fc.json"),
                     fetcher=fake_fetcher(two_planes, calls), now_fn=lambda: clock[0],
                     local_now=lambda: DAY + "T13:00")
     fc.update()
-    check("update(): one request per plane", len(calls) == 2, str(len(calls)))
+    def _count(marker):
+        return len([u for u in calls if marker in u])      # always fresh: the list grows
+    primary = [u for u in calls if "open-meteo" in u]
+    alt = [u for u in calls if "forecast.solar" in u]
+    check("update(): one request per plane for the primary source", len(primary) == 2,
+          str(len(primary)))
+    check("update(): one request per plane for the second opinion too", len(alt) == 2, str(len(alt)))
+    check("update(): the second opinion is summed over the planes, not averaged",
+          fc.alt_day_kwh == 13.341, str(fc.alt_day_kwh))
+    check("update(): the second opinion is reported separately from the primary",
+          "alt_today_kwh" in fc.as_state() and "alt_error" in fc.as_state())
     check("update(): the planes are summed, not averaged",
           abs(fc.data.dc_wh[DAY + "T12:00"] - 3200.0) < 0.01, str(fc.data.dc_wh[DAY + "T12:00"]))
     check("update(): not stale after a good fetch", fc.stale is False)
     check("update(): the cache is written", os.path.exists(os.path.join(tmp, "fc.json")))
     fc.update()
-    check("update(): the cadence is respected (no second fetch)",
-          len(calls) == 2 and fc.fetches == 1, "calls=%d fetches=%d" % (len(calls), fc.fetches))
+    check("update(): the cadence is respected (no second primary fetch)",
+          _count("open-meteo") == 2 and fc.fetches == 1,
+          "primary=%d fetches=%d" % (_count("open-meteo"), fc.fetches))
+    check("update(): the second opinion has its own cadence too",
+          _count("forecast.solar") == 2 and fc.alt_error == "", "alt=%d" % _count("forecast.solar"))
     clock[0] += 3601.0
     fc.update()
-    check("update(): ...and it fetches again once the hour is up", fc.fetches == 2, str(fc.fetches))
+    check("update(): ...and both fetch again once the hour is up",
+          fc.fetches == 2 and _count("forecast.solar") == 4,
+          "fetches=%d alt=%d" % (fc.fetches, _count("forecast.solar")))
 
     # A dead network must not cost the day: keep the last answer, flag it, keep counting.
     def broken(_url: str) -> dict:
@@ -127,11 +145,21 @@ with tempfile.TemporaryDirectory() as tmp:
           fc.last_error)
     check("a failed fetch does not stop the cycle (no exception escaped)", True)
 
+    # The second opinion must be able to fail without touching anything else.
+    fc2 = PvForecast(planes=[Plane(4.0, -90)], lat=49.12, lon=8.40, pr=0.85,
+                     every_s=3600, cache_path=os.path.join(tmp, "fc2.json"),
+                     fetcher=fake_fetcher({"azimuth=-90": series(DAY, {12: 400.0})}, []),
+                     now_fn=lambda: clock[0], local_now=lambda: DAY + "T13:00")
+    fc2.update()
+    check("the primary forecast survives an unavailable second opinion",
+          fc2.data is not None and fc2.alt_day_kwh is None and fc2.alt_error != "", fc2.alt_error)
+    check("...and says so instead of showing a number", fc2.as_state()["alt_today_kwh"] is None)
+
     # Restart: a fresh instance reads the last good answer from disk and says it is old.
-    fc2 = PvForecast(planes=[Plane(4.0, -90)], lat=49.12, lon=8.40, cache_path=os.path.join(tmp, "fc.json"),
+    fc3 = PvForecast(planes=[Plane(4.0, -90)], lat=49.12, lon=8.40, cache_path=os.path.join(tmp, "fc.json"),
                      local_now=lambda: DAY + "T13:00")
-    check("a restart reads the cached forecast back", fc2.data is not None and fc2.stale is True)
-    check("...and marks it as not freshly fetched", fc2.as_state().get("stale") is True)
+    check("a restart reads the cached forecast back", fc3.data is not None and fc3.stale is True)
+    check("...and marks it as not freshly fetched", fc3.as_state().get("stale") is True)
 
 print("what the UI gets: numbers, a factor, and a shadow verdict that decides nothing")
 st = fc.as_state(measured_today_kwh=1.6, soc=50.0, soc_target=75.0, capacity_kwh=10.0,
@@ -255,6 +283,43 @@ stub._fc = Service._fc_blank(stub, DAY)
 stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0), minutes_since_midnight=None)
 check("an unknown clock is treated as 'not at the start' (a false warning is cheap)",
       stub._fc["se_partial"] is True)
+
+print("the sky in the record: cloud cover, and the second opinion")
+_cloudy = build({"hourly": {"time": [DAY + "T%02d:00" % h for h in range(24)],
+                            "global_tilted_irradiance": [500.0] * 24,
+                            "cloud_cover": [10.0] * 7 + [90.0] * 13 + [10.0] * 4}},
+                [Plane(8.0, -90)], 0.85)
+check("clouds(): the mean over the productive hours, not the whole day",
+      _cloudy.clouds(DAY) == 90.0, str(_cloudy.clouds(DAY)))
+_clear = build({"hourly": {"time": [DAY + "T%02d:00" % h for h in range(24)],
+                           "global_tilted_irradiance": [500.0] * 24,
+                           "cloud_cover": [None] * 24}}, [Plane(8.0, -90)], 0.85)
+check("clouds(): no data is None, never 0 %", _clear.clouds(DAY) is None)
+check("parse_alt(): watt_hours_day in Wh becomes kWh",
+      parse_alt({"result": {"watt_hours_day": {DAY: 13341}}}, DAY) == 13.341,
+      str(parse_alt({"result": {"watt_hours_day": {DAY: 13341}}}, DAY)))
+check("parse_alt(): a missing day is None, not 0", parse_alt({"result": {"watt_hours_day": {}}}, DAY) is None)
+check("parse_alt(): garbage is None, not an exception", parse_alt({"result": "kaputt"}, DAY) is None)
+
+print("the hourly record: the file the rule's core assumption will be tested with")
+stub._fh_cfg_path = os.path.join(tmp, "pv_hourly.csv")
+stub._fc_cfg["hourly"] = stub._fh_cfg_path
+stub._fc = Service._fc_blank(stub, DAY)
+stub._fc["se_kwh"] = 4.2
+stub._fc["ac_kwh"] = 4.1
+Service._fh_append(stub, DAY + "T12:00")
+lines = open(stub._fh_cfg_path).read().strip().split("\n")
+check("the first line is a header", lines[0].startswith("date,hour,se_kwh"), lines[0][:40])
+check("the row carries production, integral, expectation and the sky",
+      all(k in lines[0] for k in ("se_kwh", "ac_kwh", "expected_kwh", "cloud_cover_pct",
+                                  "alt_forecast_day_kwh")), lines[0])
+check("the cumulative values are written", lines[1].split(",")[2] == "4.2", lines[1])
+check("a second hour appends a second row", (Service._fh_append(stub, DAY + "T13:00") or
+      len(open(stub._fh_cfg_path).read().strip().split("\n")) == 3))
+stub._fh_last = ""
+Service._fh_load_last(stub)
+check("a restart resumes the hour the record ends with (no duplicate line)",
+      stub._fh_last == DAY + "T13:00", stub._fh_last)
 
 print("step 1's promise: this forecast cannot steer anything")
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
