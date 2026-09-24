@@ -315,6 +315,7 @@ class PvForecast:
             f = Forecast(fetched_at=float(blob.get("fetched_at", 0.0)),
                          dc_wh={k: float(v) for k, v in (blob.get("dc_wh") or {}).items()},
                          ac_wh={k: float(v) for k, v in (blob.get("ac_wh") or {}).items()},
+                         cloud_pct={k: float(v) for k, v in (blob.get("cloud_pct") or {}).items()},
                          source=str(blob.get("source", "cache")))
             if f.ac_wh:
                 self.data, self.fetched_at, self.stale = f, f.fetched_at, True
@@ -330,7 +331,8 @@ class PvForecast:
             with open(path, "w") as fh:
                 json.dump({"fetched_at": self.fetched_at, "source": "open-meteo",
                            "dc_wh": self.data.dc_wh if self.data else {},
-                           "ac_wh": self.data.ac_wh if self.data else {}}, fh)
+                           "ac_wh": self.data.ac_wh if self.data else {},
+                           "cloud_pct": self.data.cloud_pct if self.data else {}}, fh)
         except OSError as exc:
             LOG.warning("could not write the forecast cache %s: %s", self.cache_path, exc)
 
