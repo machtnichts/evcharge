@@ -9,6 +9,7 @@ Safety model:
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import logging
 import logging.handlers
@@ -30,7 +31,9 @@ from .drivers.goe import GoEClient
 from .drivers.solaredge import SolarEdgeSite
 from .ha import HaClient
 from .proxy import ProxyStatusClient, summary as proxy_summary
-from .pv_forecast import Plane, PvForecast, factor as pv_factor
+from .pv_forecast import (Plane, PvForecast, factor as pv_factor,
+                          rolling_best as pv_rolling_best, rule_by_best as pv_rule_by_best,
+                          RULE_BEST_DAYS as pv_rule_days)
 from .safety import SwitchCounter
 from .session_meter import SessionMeter
 
@@ -211,6 +214,10 @@ class Service:
         self._fc_written_at = 0.0
         self._fc_day = ""
         self._fc = self._fc_blank(self._fc_day)
+        # The seasonal reference for the owner's rule: the best COMPLETE day of the last 30,
+        # read from the day records on disk. Without that file a restart would wipe the
+        # season's context and the rule would have nothing to compare a forecast against.
+        self._fc_best = None
         if self._fc_cfg.get("enabled"):
             settings_cfg = config.get("settings") or {}
             planes = [Plane(float(p.get("kwp", 0.0)), float(p.get("azimuth", 0.0)),
@@ -228,6 +235,7 @@ class Service:
                 timeout=float(self._fc_cfg.get("timeout_s", 20)),
                 alt_enabled=bool(self._fc_cfg.get("alt_enabled", True)))
             self._fc_load_today()
+            self._fc_load_history()
         # The hourly record (see _fh_append): one cumulative line per hour, so the question
         # "does the morning's forecast error carry into the afternoon?" can be answered from
         # this plant's own data instead of from a proxy.
@@ -564,6 +572,7 @@ class Service:
                 if self._fc_day:
                     self._fc_flush(final=True)     # close yesterday, reset for today
                 self._fc_reset(fday)
+                self._fc_load_history()            # a new day may have become the new best
             # Only a *fresh* reading may be integrated: on non-due cycles `site_state` is the
             # cached last one (fine - a zero-order hold), but if the inverter read has been
             # failing, that cached value is old, and adding it would inflate the day's measured
@@ -593,7 +602,8 @@ class Service:
                     soc_target=self.settings.priority_soc,
                     capacity_kwh=self._fc_capacity,
                     house_rest_kwh=float(self._fc_cfg.get("house_reserve_kwh", 3.0)),
-                    margin=float(self._fc_cfg.get("margin", 1.3)))
+                    margin=float(self._fc_cfg.get("margin", 1.3)),
+                    best_kwh=self._fc_best)
                 # The inverter's own daily production, published next to the forecast: it is
                 # the reference the forecast has to beat, and it comes from the read window, so
                 # it costs no extra Modbus traffic at all.
@@ -706,6 +716,12 @@ class Service:
         date = self._fc_day
         upto = (date + "T23:59") if final else self.forecast.hour_now
         d = self._fc
+        parts = self.forecast.data.parts_kwh(date)
+        # Rule B is recomputed here instead of being read from the web state: the day's record
+        # has to be complete even in the first cycle after a restart, when the state is still
+        # empty. (Only rule A stays state-derived - it needs the current SOC.)
+        fstate = pv_rule_by_best(self.forecast.data.day_kwh(date), self._fc_best)
+        fstate["would_be"] = (self.state.get("forecast") or {}).get("would_be")
         exp_sofar = self.forecast.data.until_kwh(date, upto)
         exp_sofar_dc = self.forecast.data.until_kwh(date, upto, ac=False)
         return {
@@ -731,6 +747,18 @@ class Service:
             # explained later instead of being taken on faith.
             "cloud_cover_pct": (self.forecast.data.clouds(date) if self.forecast.data else None),
             "alt_forecast_day_kwh": self.forecast.alt_day_kwh,
+            # The forecast's own split of the day, and BOTH competing rules, written down
+            # whether or not anything ever acts on them. The question "does a high forecast
+            # have to mean a strong afternoon?" can only be answered from this split - the day
+            # total cannot say which half was promised - and the two rules can only be compared
+            # if both were recorded on the same day, from the start.
+            "fc_morning_kwh": parts["morning"], "fc_midday_kwh": parts["midday"],
+            "fc_afternoon_kwh": parts["afternoon"], "fc_evening_kwh": parts["evening"],
+            "best30_kwh": fstate.get("rule_best_kwh"),
+            "best30_threshold_kwh": fstate.get("rule_threshold_kwh"),
+            "best30_pct": fstate.get("rule_pct_of_best"),
+            "rule_best_says": fstate.get("rule_says"),
+            "rule_margin_says": fstate.get("would_be"),
             "soc_min": d["soc_min"], "soc_max": d["soc_max"], "samples": d["samples"],
             "fetches": self.forecast.fetches, "failures": self.forecast.failures,
         }
@@ -800,6 +828,36 @@ class Service:
                      self._fc["ac_kwh"], self._fc["samples"])
         except (OSError, ValueError, TypeError) as exc:
             LOG.warning("could not read today's PV row: %s", exc)
+
+    def _fc_load_history(self) -> None:
+        """The plant's own best COMPLETE day of the last 30 - the seasonal reference the owner's
+        rule compares a forecast against.
+
+        Read from the day records on disk rather than kept in memory, and for a reason the owner
+        named himself: after a restart an in-memory reference would be gone and the rule would
+        have nothing to judge against. `logs/pv_forecast.csv` is that memory; a `seed` row (from
+        the inverter's own export) counts as a complete day, a `final` row only when its baseline
+        was taken at midnight.
+        """
+        rows = []
+        # Two sources on purpose: the app's own finished days, and a seed file with the
+        # inverter's exported daily production for the weeks before the app existed. Both are
+        # the same quantity (the inverter's counter for a whole day), so they can share the
+        # reference - but they are kept in separate files so neither has to imitate the other's
+        # columns.
+        for key, default in (("csv", "logs/pv_forecast.csv"),
+                             ("seed_csv", "logs/pv_days_seed.csv")):
+            path = os.path.expanduser(str(self._fc_cfg.get(key) or default))
+            try:
+                if os.path.exists(path):
+                    with open(path, newline="") as fh:
+                        rows.extend(csv.DictReader(fh))
+            except (OSError, csv.Error) as exc:
+                LOG.warning("could not read the day records %s: %s", path, exc)
+        self._fc_best = pv_rolling_best(rows, today=self.forecast.hour_now[:10])
+        LOG.info("seasonal reference: best complete day of the last %d days = %s (%d day "
+                 "records on disk)", pv_rule_days,
+                 "none yet" if self._fc_best is None else "%.2f kWh" % self._fc_best, len(rows))
 
     def _fh_append(self, hour: str) -> None:
         """One cumulative line per local hour: production, the app's own integral, and what the
@@ -982,11 +1040,14 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row"><span>battery SOC</span><span class="v" id="s_soc">-</span></div>
   <div class="row"><span>imported / exported</span><span class="v" id="s_energy">-</span></div>
   <div class="row" id="f_se_row" style="display:none" title="Der Lebensdauer-Zaehler des Wechselrichters (SunSpec WH) - genau die Zahl, die deine Monitoring-App als Produktion zeigt. Sie liegt im ohnehin gelesenen Registerfenster, kostet also keinen zusaetzlichen Modbus-Verkehr, und ist exakt: sie kann - anders als ein Integral aus Leistungsmessungen - nichts verlieren, waehrend der Dienst steht, und sie zaehlt die spaetere Akku-Entladung mit (fair: gezaehlt wird einmal, was der Wechselrichter abgegeben hat)."><span>PV produced today (counter)</span><span class="v" id="f_se">-</span></div>
-  <div class="row" id="f_day_row" style="display:none" title="Lokale PV-Prognose fuer das Dach (Open-Meteo, 4 kWp Ost + 4 kWp West) - die Rest-Prognose fuer heute. Das wird noch NICHT gesteuert: die Zahl wird nur angezeigt und taeglich mitgeloggt, damit wir sehen, ob so eine Prognose fuer dieses Dach taugt.">
+  <div class="row" id="f_day_row" style="display:none" title="Lokale PV-Prognose fuer das Dach (Open-Meteo, 14 Module Ost + 11 Module West, davon 5 auf dem Dach und 6 auf der flacheren Gaube) - die Prognose fuer heute. Das wird noch NICHT gesteuert: die Zahl wird nur angezeigt und taeglich mitgeloggt, damit wir sehen, ob so eine Prognose fuer dieses Dach taugt.">
     <span>PV forecast today</span><span class="v" id="f_day">-</span></div>
   <div class="row" id="f_rest_row" style="display:none"><span>forecast rest of day</span><span class="v" id="f_rest">-</span></div>
   <div class="row" id="f_factor_row" style="display:none"><span>factor today</span><span class="v" id="f_factor">-</span></div>
-  <div class="row" id="f_would_row" style="display:none"><span>rule would say</span><span class="v" id="f_would">-</span></div>
+  <div class="row" id="f_best_row" style="display:none" title="Regel B (die des Eigentuemers), saisonal-relativ: eine Tagessumme nahe am Bestwert dieser Jahreszeit kann ohne starken Nachmittag nicht zustande kommen - deshalb darf das Auto morgens zuerst. Eine mittlere Prognose sagt dagegen nichts darueber, welche Tageshaelfte gut wird. Geprueft an 7 Tagen mit 15-Minuten-Exporten: ab 88 Prozent des Bestwerts war der Nachmittag jedes Mal stark, bei 71-78 Prozent jedes Mal mittel bis schwach. Der Bestwert ist der beste VOLLSTAENDIGE Tag der letzten 30 (Tage, deren Zaehlerbasis nicht um Mitternacht lag, zaehlen nicht) - die Schwelle waechst also mit der Jahreszeit mit.">
+    <span>forecast vs best day (30d)</span><span class="v" id="f_best">-</span></div>
+  <div class="row" id="f_would_row" style="display:none"><span>rule A (factor+margin) would say</span><span class="v" id="f_would">-</span></div>
+  <div class="row" id="f_rb_row" style="display:none"><span>rule B (season) would say</span><span class="v" id="f_rb">-</span></div>
  </div>
  <div class="card"><h2>Vehicle</h2>
   <div class="row"><span>state</span><span class="v" id="c_state">-</span></div>
@@ -1092,7 +1153,7 @@ async function load(){
  // decision - the owner wants to judge the forecast against his own roof first, so the row
  // reports what the rule *would* say and nothing acts on it.
  (function(){
-   const f=s.forecast||{}, ids=["f_day_row","f_rest_row","f_factor_row","f_would_row"];
+   const f=s.forecast||{}, ids=["f_day_row","f_rest_row","f_factor_row","f_best_row","f_would_row","f_rb_row"];
    // The inverter's counter row stands on its own: it works whether or not the forecast module
    // is enabled, because it costs nothing extra (its register is in the window already).
    const seRow=document.getElementById("f_se_row"), seVal=document.getElementById("f_se");
@@ -1134,6 +1195,38 @@ async function load(){
    fac.textContent=(f.factor_today===null||f.factor_today===undefined)?"noch keine Basis":n2(f.factor_today);
    fac.title="gemessen heute / Prognose fuer genau dieses Fenster. Unter 0.3 kWh Prognose wird kein "
      +"Faktor gebildet - das waere eine Division durch Rauschen (Vorlauf des Tages, truebe Stunden).";
+   // Rule B (the owner's, seasonal-relative) next to rule A (the older factor+margin one).
+   // Both are computed and logged every day even though neither steers anything - that is
+   // exactly how the two can be compared against real days later.
+   const br=document.getElementById("f_best"), rb=document.getElementById("f_rb");
+   br.textContent=(f.rule_best_kwh===null||f.rule_best_kwh===undefined)
+     ?"keine Referenz":(Math.round(f.rule_pct_of_best)+" % von "+k(f.rule_best_kwh)
+       +" (Schwelle "+k(f.rule_threshold_kwh)+" = "+Math.round(f.rule_best_fraction*100)+" %)");
+   br.title="Prognose heute "+k(f.today_kwh)+" gegen den besten VOLLSTAENDIGEN Tag der letzten 30: "
+     +k(f.rule_best_kwh)+" -> Schwelle "+k(f.rule_threshold_kwh)
+     +" | Der Bestwert waechst mit der Jahreszeit mit (Juni rund 52 kWh, September rund 33 kWh), "
+     +"deshalb ist die Schwelle relativ und nicht fest."
+     +" | Belegt an 7 Tagen mit 15-Minuten-Daten: ab 88 % des Bestwerts war der Nachmittag 3x stark "
+     +"(17.9-19.2 kWh in 12-18 Uhr), bei 71-78 % 3x mittel bis schwach (8.9-14.1 kWh), ohne "
+     +"Ueberschneidung zwischen den Gruppen."
+     +" | NUR ANZEIGE UND LOG, kein Steuereingriff.";
+   if(f.rule_says&&f.rule_says!=="no_data"){
+     rb.textContent=(f.rule_says==="car"?"Auto-Vorrang (Nachmittag kommt)":"Akku-Vorrang (Prognose sagt nichts)");
+     rb.className="v"+(f.rule_says==="battery"?" warn":"");
+     rb.title="Regel B, saisonal-relativ: Prognose heute "+k(f.today_kwh)+" = "
+       +Math.round(f.rule_pct_of_best)+" % vom besten Tag der letzten 30 ("+k(f.rule_best_kwh)
+       +"), Schwelle "+Math.round(f.rule_best_fraction*100)+" % = "+k(f.rule_threshold_kwh)+". "
+       +(f.rule_says==="car"
+         ?"Ueber der Schwelle: eine solche Tagessumme ist ohne starken Nachmittag nicht moeglich, "
+          +"das Auto darf morgens zuerst."
+         :"Unter der Schwelle: die Prognose sagt nichts ueber die Tageshaelfte, also bleibt der Akku "
+          +"zuerst dran - das Auto laedt weiter nur auf dem gemessenen Ueberschuss.")
+       +" NUR ANZEIGE UND LOG, kein Steuereingriff.";
+   }else{
+     rb.textContent="keine Referenz (noch kein vollstaendiger Tag)";
+     rb.title="Regel B braucht den besten VOLLSTAENDIGEN Tag der letzten 30 als Referenz. Solange "
+       +"keiner vorliegt, gibt es kein Urteil - eine Regel ohne Messbasis waere geraten.";
+   }
    if(f.would_be_text){
      wld.textContent=f.would_be_text;
      wld.className="v"+(f.would_be==="battery"?" warn":"");

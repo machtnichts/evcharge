@@ -29,6 +29,7 @@ Pure arithmetic is separated from the network so it can be tested without one
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
@@ -51,6 +52,16 @@ FACTOR_MIN, FACTOR_MAX = 0.25, 1.60
 # evidence and must not be logged as an anomaly); above it, a wildly out-of-range factor is
 # worth a warning.
 MIN_MEASURED_KWH = 0.05
+# The rule the owner proposed, in the form his own September data supports. His reasoning: a
+# day total near the top of what the season can do cannot happen without a strong afternoon,
+# so a high forecast means the afternoon will refill the battery - while a middling one says
+# nothing about which half will be good. Measured against seven days of 15-minute exports:
+# at 88-93 % of the season's best day the afternoon was strong every time (17.9-19.2 kWh),
+# at 71-78 % it was mediocre every time (8.9-14.1 kWh), with no overlap between the groups.
+# Hence the reference is the plant's OWN best day of the last 30 - not a fixed kWh figure,
+# which would be wrong in June (best day ~52 kWh) and in December alike.
+RULE_BEST_DAYS = 30
+RULE_BEST_FRACTION = 0.90
 
 
 @dataclass(frozen=True)
@@ -86,6 +97,21 @@ class Forecast:
                 continue
             total += wh
         return total / 1000.0                                # Wh -> kWh
+
+    def parts_kwh(self, date: str, ac: bool = True) -> Dict[str, float]:
+        """The day split the way the owner reasons about it: morning, midday, afternoon, evening.
+
+        Recorded per day from the start, because the day total alone cannot say which half of
+        the day was promised - and the whole question (does a high forecast have to mean a
+        strong afternoon?) lives in this split, not in the total.
+        """
+        def u(hour: int) -> float:
+            return self._sum(self.ac_wh if ac else self.dc_wh, date,
+                             upto="%sT%02d:59" % (date, hour))
+        return {"morning": round(max(0.0, u(11) - u(7)), 3),      # 08-11
+                "midday": round(max(0.0, u(14) - u(11)), 3),      # 12-14
+                "afternoon": round(max(0.0, u(17) - u(14)), 3),   # 15-17
+                "evening": round(max(0.0, u(20) - u(17)), 3)}     # 18-20
 
     def day_kwh(self, date: str, ac: bool = True) -> float:
         return self._sum(self.ac_wh if ac else self.dc_wh, date)
@@ -164,6 +190,60 @@ def factor(measured_kwh: Optional[float], expected_kwh: Optional[float]) -> Opti
                     "ignored", f, measured_kwh, expected_kwh)
         return None
     return round(f, 3)
+
+
+def rolling_best(rows: List[Dict], days: int = RULE_BEST_DAYS, today: Optional[str] = None,
+                 field: str = "se_production_kwh") -> Optional[float]:
+    """Best COMPLETE day in the window - the seasonal reference the forecast is judged against.
+
+    Complete means the day's baseline was taken at midnight: a day the service only saw from
+    noon onwards has a total that is not a day's total and must not become the reference.
+    Seeded rows (`row = "seed"`) come from the inverter's own export and are complete by
+    definition. Today itself is never counted - it is still growing.
+    """
+    cut, now = None, (str(today)[:10] if today else None)
+    if now:
+        try:
+            cut = (dt.date.fromisoformat(now) - dt.timedelta(days=days)).isoformat()
+        except ValueError:
+            cut = None
+    best = None
+    for r in rows:
+        kind = str(r.get("row") or "")
+        if kind not in ("final", "seed"):
+            continue
+        day = str(r.get("date") or "")[:10]
+        if not day or (now and day >= now) or (cut and day < cut):
+            continue
+        if kind == "final" and int(float(r.get("se_partial") or 0) or 0):
+            continue
+        try:
+            val = float(r.get(field))
+        except (TypeError, ValueError):
+            continue
+        if val > 0 and (best is None or val > best):
+            best = val
+    return best
+
+
+def rule_by_best(forecast_day_kwh: Optional[float], best_kwh: Optional[float],
+                 fraction: float = RULE_BEST_FRACTION) -> Dict:
+    """The owner's rule, made seasonal-relative: judge the forecast against the plant's own
+    best day, not against a fixed number. Returns numbers plus a verdict word - and `no_data`
+    whenever there is not yet a reference, because a verdict without evidence is a guess."""
+    out: Dict = {"rule_best_kwh": None if best_kwh is None else round(float(best_kwh), 3),
+                 "rule_best_fraction": fraction, "rule_threshold_kwh": None,
+                 "rule_pct_of_best": None, "rule_says": "no_data"}
+    try:
+        fc, best = float(forecast_day_kwh), float(best_kwh)
+    except (TypeError, ValueError):
+        return out
+    if best <= 0 or fc < 0:
+        return out
+    out["rule_threshold_kwh"] = round(best * fraction, 2)
+    out["rule_pct_of_best"] = round(100.0 * fc / best, 1)
+    out["rule_says"] = "car" if fc >= best * fraction else "battery"
+    return out
 
 
 class PvForecast:
@@ -341,7 +421,8 @@ class PvForecast:
                  soc: Optional[float] = None, soc_target: Optional[float] = None,
                  capacity_kwh: Optional[float] = None,
                  house_rest_kwh: Optional[float] = None,
-                 margin: float = 1.3) -> Dict:
+                 margin: float = 1.3,
+                 best_kwh: Optional[float] = None) -> Dict:
         """Everything the UI needs - numbers only, no verdict that could be mistaken for a
         control decision (step 1: the rule is not wired, this is evidence gathering)."""
         hour = self.hour_now
@@ -383,4 +464,10 @@ class PvForecast:
             out["would_be"] = "battery" if supply < need * margin else "car"
             out["would_be_text"] = ("Akku-Vorrang (Rest reicht nicht)" if supply < need * margin
                                     else "Auto-Vorrang (Rest reicht fuer den Akku)")
+        out["parts"] = self.data.parts_kwh(date)
+        # The owner's rule in its seasonal-relative form (rule_by_best), published NEXT TO the
+        # older factor-based shadow verdict rather than instead of it: both go into the day's
+        # record, so the history decides which of the two was right. Comparing them is the
+        # point of step 1 - nothing here steers anything.
+        out.update(rule_by_best(out.get("today_kwh"), best_kwh))
         return out

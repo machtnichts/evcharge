@@ -73,16 +73,32 @@ and steers nothing**, because the owner wants to judge it against his own roof f
 * Config block `forecast`: coordinates, planes (`kwp`/`azimuth`/`tilt`), `pr`, `every_s`,
   `write_s`, `house_reserve_kwh`, `margin`, and the three file paths. With `enabled: false` the
   module is not even constructed.
-* **The factor that makes it usable:** `measured today / predicted for exactly this window`,
-  which pulls a dull morning's forecast down with it. It needs a basis - below 0.05 kWh measured
-  there is no factor (the day has not started, and that is not an anomaly), and outside
-  0.25-1.60 it is refused with a warning. No factor means the planned rule falls back to its
-  sun-relative default instead of trusting a number.
-* **Evidence:** `logs/pv_forecast_today.json` (rewritten every `write_s`, resumed after a
-  restart) and one row per finished day in `logs/pv_forecast.csv`: forecast, both measured
-  figures (AC side and array side), both factors, house/car/battery energy, SOC range, and
-  `samples`. The measured figures are a zero-order hold of the app's own reads, so `samples` is
-  part of the record; a stale reading is never integrated.
+* **The factor is computed and logged, but it was disproved as a control input.** The idea was
+  `measured today / predicted for exactly this window`, pulling a dull morning's forecast down
+  with it. Seven days of 15-minute portal exports killed it: 08.09. had a dead morning (2.56 of
+  6.88 kWh predicted) followed by a strong afternoon, 10.09. was the mirror image (morning
+  exactly as predicted, 0.98) with the afternoon collapsing to 0.51. The morning therefore says
+  nothing about the afternoon, in either direction - a noon factor would have told the owner "all
+  good" on 10.09. and spent the battery on the car. It keeps a basis requirement (below 0.05 kWh
+  measured there is no factor; outside 0.25-1.60 it is refused with a warning) and stays in the
+  record, where it can be compared against the rule below.
+* **The rule that survived is seasonal-relative** - the owner's own idea, sharpened by the same
+  seven days: a day total near the top of what this season can do cannot happen without a strong
+  afternoon, so a high forecast may hand the morning to the car. Measured: at 88-93 % of the
+  season's best day the afternoon was strong every time (17.9-19.2 kWh in 12-18 h), at 71-78 %
+  mediocre every time (8.9-14.1 kWh); the two groups do not overlap. So the reference is the
+  plant's OWN best complete day of the last 30 (`rolling_best`, read back from the day records so
+  a restart cannot wipe it) with a **90 % threshold** (`rule_by_best`). Against all seven days:
+  **7 of 7 classified correctly**. Days before this app existed are seeded from the inverter's own
+  export (`logs/pv_days_seed.csv`), because a reference without history is a guess.
+* **Evidence, all of it on disk** (a restart must not cost the history): `logs/pv_forecast_today.json`
+  (rewritten every `write_s`, resumed after a restart) and one row per finished day in
+  `logs/pv_forecast.csv` - the forecast both as a total and split into morning/midday/afternoon/
+  evening, the measured figures (AC side and array side), both factors, house/car/battery energy,
+  SOC range, `samples`, and the rule columns (`best30_kwh`, `best30_threshold_kwh`, `best30_pct`,
+  `rule_best_says`, `rule_margin_says`). Both rules are written down every day precisely so the
+  history can later decide which one was right. The measured figures are a zero-order hold of the
+  app's own reads, so `samples` is part of the record; a stale reading is never integrated.
 * **The day's production comes from the inverter's own counter**, not from an integral: SunSpec
   model 101 `WH` sits inside the window this driver reads anyway, so it costs **no extra Modbus
   traffic** (pinned by a test: still three reads, 103 registers). It is exact, it survives a
@@ -92,9 +108,10 @@ and steers nothing**, because the owner wants to judge it against his own roof f
   advanced 0.0200 kWh and the app's AC integral advanced 0.0200 kWh. Compare the two as
   **deltas over the same window**, never as totals right after a restart: the integral resumes
   from the day's file, the counter's baseline only if the file has one.
-* The UI rows say "PV forecast today", "forecast rest of day", "factor today" and "rule would
-  say" - the last one is a *displayed* verdict that nothing acts on, with its inputs in the
-  tooltip so it cannot be mistaken for a decision.
+* The UI rows say "PV forecast today", "forecast rest of day", "factor today", "forecast vs best
+  day (30d)", "rule A (factor+margin) would say" and "rule B (season) would say". The two rule
+  rows are *displayed* verdicts that nothing acts on, each with its inputs in the tooltip so
+  neither can be mistaken for a decision.
 * **Pinned by tests** (`tests/test_pv_forecast.py`): the module has no actuator vocabulary and
   `evcharge/controller.py` does not contain the word "forecast" at all. That is what makes "step
   1 steers nothing" checkable rather than promised - and it stays that way until step 2 is

@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from evcharge.drivers.solaredge import SiteState                     # noqa: E402
 from evcharge.main import Service, day_delta                            # noqa: E402
 from evcharge.pv_forecast import (Forecast, Plane, PvForecast, build, factor, parse_alt,   # noqa: E402
-                                  parse_hour, planes_kwp)
+                                  parse_hour, planes_kwp, rolling_best, rule_by_best)
 
 FAILS = []
 
@@ -187,7 +187,10 @@ check("as_state(): disabled means disabled", off["enabled"] is False and "today_
 print("the day's bookkeeping (main.Service helpers, driven without a service)")
 stub = types.SimpleNamespace(_fc_cfg={"csv": os.path.join(tmp, "pv.csv"),
                                       "today": os.path.join(tmp, "pv_today.json")},
-                             _fc_day=DAY, _fc=None, forecast=fc)
+                             _fc_day=DAY, _fc=None, forecast=fc,
+                             # The real service always has both: `state` is what the web UI
+                             # reads, `_fc_best` is the seasonal reference rule B judges against.
+                             state={}, _fc_best=None)
 stub._fc_blank = lambda day: Service._fc_blank(stub, day)      # unbound helpers, instance-shape
 stub._fc_row = lambda final: Service._fc_row(stub, final)
 Service._fc_reset(stub, DAY)
@@ -320,6 +323,72 @@ stub._fh_last = ""
 Service._fh_load_last(stub)
 check("a restart resumes the hour the record ends with (no duplicate line)",
       stub._fh_last == DAY + "T13:00", stub._fh_last)
+
+print("the seasonal reference: which day counts, and what rule B does with it")
+_rows = [
+    {"row": "final", "date": "2026-09-06", "se_production_kwh": "33.498", "se_partial": "0"},
+    {"row": "seed", "date": "2026-09-05", "se_production_kwh": "29.847"},
+    {"row": "final", "date": "2026-09-08", "se_production_kwh": "31.263", "se_partial": "1"},
+    {"row": "partial", "date": "2026-09-09", "se_production_kwh": "99.0"},
+    {"row": "final", "date": "2026-09-23", "se_production_kwh": "40.0", "se_partial": "0"},
+]
+check("rolling_best: the best COMPLETE day wins", rolling_best(_rows, today=DAY) == 33.498,
+      str(rolling_best(_rows, today=DAY)))
+check("...a day whose counter baseline was not taken at midnight is not a day (31.263 skipped)",
+      rolling_best(_rows[2:3], today=DAY) is None)
+check("...a seed day from the inverter's own export counts",
+      rolling_best([_rows[1]], today=DAY) == 29.847)
+check("...today is never the reference (40.0 would be)", rolling_best([_rows[4]], today=DAY) is None)
+check("...an unfinished row is skipped", rolling_best([_rows[3]], today=DAY) is None)
+check("...outside the 30-day window it is ignored",
+      rolling_best([{"row": "seed", "date": "2026-07-01", "se_production_kwh": "50"}],
+                   today=DAY) is None)
+check("...no records means no reference, not a guessed one", rolling_best([], today=DAY) is None)
+_r = rule_by_best(31.33, 33.498)
+check("rule_by_best: 93 % of the best -> the car may go first", _r["rule_says"] == "car", str(_r))
+check("...the threshold is 90 % of the best day", _r["rule_threshold_kwh"] == 30.15, str(_r))
+check("...26.36 kWh (the day the afternoon then failed) -> the battery stays first",
+      rule_by_best(26.36, 33.498)["rule_says"] == "battery")
+check("...exactly at the threshold still counts as car",
+      rule_by_best(30.15, 33.498)["rule_says"] == "car")
+check("...without a reference there is no verdict at all",
+      rule_by_best(31.0, None)["rule_says"] == "no_data")
+check("...and a nonsensical reference gives no verdict either",
+      rule_by_best(31.0, 0.0)["rule_says"] == "no_data")
+
+print("the day's split: the only place a forecast's shape is kept")
+_f = build(series(DAY, {h: 1000.0 for h in range(8, 21)}), [Plane(1.0, -90, 25)], 1.0)
+_p = _f.parts_kwh(DAY)
+check("parts_kwh: the four blocks tile the day - no gap, no overlap",
+      abs(sum(_p.values()) - _f.day_kwh(DAY)) < 1e-9, str(_p))
+check("parts_kwh: morning is 08-11 (four hours)", abs(_p["morning"] - 4.0) < 1e-9, str(_p))
+check("parts_kwh: midday 12-14, afternoon 15-17, evening 18-20 (three hours each)",
+      abs(_p["midday"] - 3.0) < 1e-9 and abs(_p["afternoon"] - 3.0) < 1e-9
+      and abs(_p["evening"] - 3.0) < 1e-9, str(_p))
+
+print("the day record: reference and both rules have to survive a restart")
+_rec, _seed = os.path.join(tmp, "days.csv"), os.path.join(tmp, "seed.csv")
+with open(_rec, "w") as _fh:
+    _fh.write("date,row,se_production_kwh,se_partial\n2026-09-07,final,20.568,0\n")
+with open(_seed, "w") as _fh:
+    _fh.write("date,row,se_production_kwh\n2026-09-06,seed,33.498\n")
+stub._fc_cfg["csv"], stub._fc_cfg["seed_csv"] = _rec, _seed
+stub._fc_best = None
+Service._fc_load_history(stub)
+check("_fc_load_history: the app's own days and the seed file share one reference",
+      stub._fc_best == 33.498, str(stub._fc_best))
+_grade = Service._fc_row(stub, False)
+_missing = [k for k in ("fc_morning_kwh", "fc_midday_kwh", "fc_afternoon_kwh", "fc_evening_kwh",
+                        "best30_kwh", "best30_threshold_kwh", "best30_pct", "rule_best_says",
+                        "rule_margin_says") if k not in _grade]
+check("the day's record carries the forecast split, the reference and both rules",
+      _missing == [], str(_missing))
+_day = stub.forecast.data.day_kwh(DAY)
+check("...and rule B's numbers in it are the real ones, not the empty web state",
+      _grade["best30_kwh"] == 33.498 and _grade["best30_threshold_kwh"] == 30.15
+      and abs(_grade["best30_pct"] - round(100.0 * _day / 33.498, 1)) < 0.05
+      and _grade["rule_best_says"] == ("car" if _day >= 30.15 else "battery"),
+      "%s / %s / %s" % (_grade["best30_kwh"], _grade["rule_best_says"], _grade["best30_pct"]))
 
 print("step 1's promise: this forecast cannot steer anything")
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
