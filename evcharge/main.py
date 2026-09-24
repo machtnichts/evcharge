@@ -52,6 +52,11 @@ SITE_FAIL_BASE_S = 30.0
 SITE_FAIL_MAX_S = 600.0
 
 
+# Sentinel for "the caller did not say" - an explicit None has to stay expressible, because it
+# means "the clock could not be read", which is a different answer from "not provided".
+_UNSET = object()
+
+
 def day_delta(current: Optional[float], baseline: Optional[float]) -> Optional[float]:
     """A day's production from a lifetime counter: how far it advanced since the day's baseline.
 
@@ -639,7 +644,7 @@ class Service:
             d["soc_max"] = soc if d["soc_max"] is None else max(d["soc_max"], soc)
         d["samples"] += 1
 
-    def _fc_se_latch(self, site_state, minutes_since_midnight: Optional[int] = None) -> None:
+    def _fc_se_latch(self, site_state, minutes_since_midnight=_UNSET) -> None:
         """Derive today's production from the inverter's lifetime AC counter.
 
         This is the figure the owner's own app calls production, and it is exact: unlike the
@@ -664,7 +669,7 @@ class Service:
             # energy already in the day (a restart, a late deploy), and the clock (a start well
             # after midnight). An unknown clock counts as "not at the start" - a false warning
             # is cheap, a missing one is not.
-            if minutes_since_midnight is None:
+            if minutes_since_midnight is _UNSET:
                 minutes_since_midnight = self._minutes_since_midnight()
             d["se_partial"] = bool(d["samples"] or d["ac_kwh"]) or \
                 (minutes_since_midnight is None or minutes_since_midnight > 30)

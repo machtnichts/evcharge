@@ -214,7 +214,11 @@ check("day_delta(): no baseline -> no figure", day_delta(29267.336, None) is Non
 check("day_delta(): no reading -> no figure", day_delta(None, 29240.1) is None)
 check("day_delta(): a counter that went backwards is not a small number",
       day_delta(29240.1, 29267.336) is None)
-stub._fc_se_latch = lambda st: Service._fc_se_latch(stub, st)
+stub._fc_se_latch = lambda st, **kw: Service._fc_se_latch(stub, st, **kw)
+# Driving Service helpers on a stub means binding every collaborator they call - this one grows
+# with the feature, and forgetting it fails the test, not the app. 00:01 is the day's start, so
+# the default here is "the baseline was taken at midnight".
+stub._minutes_since_midnight = lambda: 1
 stub._fc = Service._fc_blank(stub, DAY)
 stub._fc_se_latch(SiteState(inverter_energy_kwh=29240.0))
 check("the baseline is latched on the first reading, with no figure yet",
