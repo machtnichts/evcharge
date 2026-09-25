@@ -149,5 +149,16 @@ print("  inbound set/max_current applied     %s" % ("PASS" if amp_calls else "FA
 expected = ("homeassistant/sensor/evcharge_wt/pv_power/config" in topics and
             "evcharge/state" in topics and mode_calls and amp_calls and
             any(s.endswith("set/#") for s in subscribed))
+
+# Jinja renders a JSON boolean as "True"/"False" - neither the binary sensor (ON/OFF) nor the
+# switch (payload_off "false") matches that, and both entities stayed unknown until the
+# templates spelled it out. Pinned on the source because Home Assistant renders them, not this
+# client: a silent regression here means two dead entities in HA, not a failed test.
+_mqtt_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "evcharge", "mqtt.py")).read()
+_bool_ok = ("{{ 'ON' if value_json.charger.charging else 'OFF' }}" in _mqtt_src
+            and "{{ 'true' if value_json.control_enabled else 'false' }}" in _mqtt_src)
+print("  boolean templates spelled out        %s" % ("PASS" if _bool_ok else "FAIL"))
+expected = expected and _bool_ok
 print("\nRESULT: %s" % ("ALL PASS" if expected else "FAILURES PRESENT"))
 sys.exit(0 if expected else 1)

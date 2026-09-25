@@ -224,7 +224,10 @@ class HomeAssistantMqtt:
                 "json_attributes_topic": _topic(self.prefix, "state"),
             })
         self._entity("binary_sensor", "charging", "EV charging", {
-            "value_template": "{{ value_json.charger.charging }}",
+            # Jinja renders a JSON boolean as "True"/"False", which is not what an MQTT binary
+            # sensor compares against (ON/OFF). Spell it out instead - this path only ever ran
+            # once MQTT was switched on, and that is exactly when it was found.
+            "value_template": "{{ 'ON' if value_json.charger.charging else 'OFF' }}",
             "device_class": "plug",
         })
         self._entity("select", "mode", "Charging mode", {
@@ -233,7 +236,8 @@ class HomeAssistantMqtt:
             "options": ["off", "now", "minpv", "pv"],
         })
         self._entity("switch", "control_enabled", "EV charge control enabled", {
-            "value_template": "{{ value_json.control_enabled }}",
+            # Same trap as the binary sensor above: "False" (Python) is not "false" (payload_off).
+            "value_template": "{{ 'true' if value_json.control_enabled else 'false' }}",
             "command_topic": _topic(self.prefix, "set/control_enabled"),
             "payload_on": "true", "payload_off": "false",
         })
