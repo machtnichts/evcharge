@@ -412,6 +412,40 @@ with open(_hdr, "w") as _fh:
 check("an unknown column stops the rewrite instead of guessing",
       Service._fc_fix_header(stub, _hdr, _keys) is False)
 
+print("the garage meter in the day row: the owner's own reference for the car")
+
+
+class _Meter:
+    def as_state(self):
+        return {"import_kwh": 9326.82, "export_kwh": 2540.71}
+
+
+stub.session_meter = _Meter()
+stub._fc_sdm_prev = {}
+_sdm = Service._fc_sdm_daily(stub)
+check("the meter's counters are read into the row",
+      _sdm["sdm_import_kwh"] == 9326.82 and _sdm["sdm_export_kwh"] == 2540.71, str(_sdm))
+check("...without a previous close there is no delta, not a made-up one",
+      _sdm["sdm_import_day_kwh"] is None, str(_sdm))
+stub._fc_sdm_prev = {"import_kwh": 9323.57, "export_kwh": 2537.67}
+_sdm = Service._fc_sdm_daily(stub)
+check("...with one, the day's delta is the difference",
+      _sdm["sdm_import_day_kwh"] == 3.25 and _sdm["sdm_export_day_kwh"] == 3.04, str(_sdm))
+_grade = Service._fc_row(stub, False)
+check("...and the day's row carries all four fields (car_kwh next to the meter)",
+      all(k in _grade for k in ("sdm_import_kwh", "sdm_export_kwh", "sdm_import_day_kwh",
+                                "sdm_export_day_kwh", "car_kwh")), sorted(_grade))
+
+
+class _Kaputt:
+    def as_state(self):
+        raise RuntimeError("meter weg")
+
+
+stub.session_meter = _Kaputt()
+check("a broken meter never breaks the day's close",
+      Service._fc_sdm_daily(stub)["sdm_import_kwh"] is None)
+
 print("step 1's promise: this forecast cannot steer anything")
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "evcharge", "pv_forecast.py")).read()

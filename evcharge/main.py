@@ -218,6 +218,8 @@ class Service:
         # read from the day records on disk. Without that file a restart would wipe the
         # season's context and the rule would have nothing to compare a forecast against.
         self._fc_best = None
+        # The garage meter's counters at the last day's close, for the next day's delta.
+        self._fc_sdm_prev = {}
         if self._fc_cfg.get("enabled"):
             settings_cfg = config.get("settings") or {}
             planes = [Plane(float(p.get("kwp", 0.0)), float(p.get("azimuth", 0.0)),
@@ -722,6 +724,7 @@ class Service:
         # empty. (Only rule A stays state-derived - it needs the current SOC.)
         fstate = pv_rule_by_best(self.forecast.data.day_kwh(date), self._fc_best)
         fstate["would_be"] = (self.state.get("forecast") or {}).get("would_be")
+        sdm = self._fc_sdm_daily()
         exp_sofar = self.forecast.data.until_kwh(date, upto)
         exp_sofar_dc = self.forecast.data.until_kwh(date, upto, ac=False)
         return {
@@ -759,9 +762,42 @@ class Service:
             "best30_pct": fstate.get("rule_pct_of_best"),
             "rule_best_says": fstate.get("rule_says"),
             "rule_margin_says": fstate.get("would_be"),
+            # The garage meter - the owner's own reference for the car - so a session this
+            # process never saw shows up as a gap in the same row instead of being found later.
+            "sdm_import_kwh": sdm["sdm_import_kwh"], "sdm_export_kwh": sdm["sdm_export_kwh"],
+            "sdm_import_day_kwh": sdm["sdm_import_day_kwh"],
+            "sdm_export_day_kwh": sdm["sdm_export_day_kwh"],
             "soc_min": d["soc_min"], "soc_max": d["soc_max"], "samples": d["samples"],
             "fetches": self.forecast.fetches, "failures": self.forecast.failures,
         }
+
+    def _fc_sdm_daily(self) -> Dict:
+        """The garage meter's counters and their day delta - the owner's own reference.
+
+        He tracks the car through the SDM630, and he is right to: the session log can only see
+        what this process saw (a session that ran while the service was down, or before it
+        existed, leaves no row at all - 23.09.2026 is the case in point, 19.38 kWh in, 0.0
+        booked). Writing the meter's own counters into the day row makes such a gap visible in
+        the same line instead of being found weeks later by hand.
+        """
+        out = {"sdm_import_kwh": None, "sdm_export_kwh": None,
+               "sdm_import_day_kwh": None, "sdm_export_day_kwh": None}
+        meter = getattr(self, "session_meter", None)
+        if meter is None:
+            return out
+        try:
+            st = meter.as_state()
+        except Exception as exc:  # noqa: BLE001 - evidence must never break the day's close
+            LOG.warning("could not read the garage meter for the day row: %s", exc)
+            return out
+        imp, exp = st.get("import_kwh"), st.get("export_kwh")
+        out["sdm_import_kwh"], out["sdm_export_kwh"] = imp, exp
+        prev = getattr(self, "_fc_sdm_prev", None) or {}
+        if imp is not None and prev.get("import_kwh") is not None:
+            out["sdm_import_day_kwh"] = round(float(imp) - float(prev["import_kwh"]), 3)
+        if exp is not None and prev.get("export_kwh") is not None:
+            out["sdm_export_day_kwh"] = round(float(exp) - float(prev["export_kwh"]), 3)
+        return out
 
     def _fc_fix_header(self, csv_path: str, keys: list) -> bool:
         """Keep the day record's header in step with its rows. True if it had to be rewritten.
@@ -847,6 +883,9 @@ class Service:
                      row["measured_array_kwh"], row["house_kwh"], row["car_kwh"],
                      row["battery_charge_kwh"], row["battery_discharge_kwh"],
                      row["soc_min"], row["soc_max"], row["samples"])
+            # Remember the meter at this close: tomorrow's row diffs against it.
+            self._fc_sdm_prev = {"import_kwh": row.get("sdm_import_kwh"),
+                                 "export_kwh": row.get("sdm_export_kwh")}
         except OSError as exc:
             LOG.warning("could not append to %s: %s", csv_path, exc)
 
@@ -907,6 +946,17 @@ class Service:
             except (OSError, csv.Error) as exc:
                 LOG.warning("could not read the day records %s: %s", path, exc)
         self._fc_best = pv_rolling_best(rows, today=self.forecast.hour_now[:10])
+        # The garage meter at the last close, so tomorrow's row can diff against it.
+        for _r in reversed(rows):
+            if _r.get("sdm_import_kwh"):
+                try:
+                    self._fc_sdm_prev = {
+                        "import_kwh": float(_r["sdm_import_kwh"]),
+                        "export_kwh": (float(_r["sdm_export_kwh"])
+                                       if _r.get("sdm_export_kwh") else None)}
+                except (TypeError, ValueError):
+                    pass
+                break
         LOG.info("seasonal reference: best complete day of the last %d days = %s (%d day "
                  "records on disk)", pv_rule_days,
                  "none yet" if self._fc_best is None else "%.2f kWh" % self._fc_best, len(rows))
