@@ -390,6 +390,25 @@ check("...and rule B's numbers in it are the real ones, not the empty web state"
       and _grade["rule_best_says"] == ("car" if _day >= 30.15 else "battery"),
       "%s / %s / %s" % (_grade["best30_kwh"], _grade["rule_best_says"], _grade["best30_pct"]))
 
+print("the day record's header: it must follow the columns, not lag behind")
+_hdr = os.path.join(tmp, "ragged.csv")
+with open(_hdr, "w") as _fh:
+    _fh.write("row,date,se_production_kwh\nfinal,2026-09-23,29.371\n")
+_keys = ["row", "date", "se_production_kwh", "best30_kwh", "rule_best_says"]
+check("a matching header is left alone", Service._fc_fix_header(stub, _hdr, _keys[:3]) is False)
+check("a grown column set rewrites the header once",
+      Service._fc_fix_header(stub, _hdr, _keys) is True)
+_lines = open(_hdr).read().strip().split("\n")
+check("...the header now matches the columns", _lines[0] == ",".join(_keys), _lines[0])
+check("...and the old row survives, padded - nothing is dropped",
+      _lines[1] == "final,2026-09-23,29.371,,", _lines[1])
+check("...a second call changes nothing (no rewrite loop)",
+      Service._fc_fix_header(stub, _hdr, _keys) is False)
+with open(_hdr, "w") as _fh:
+    _fh.write("row,date,spalte_die_es_nicht_mehr_gibt\nfinal,2026-09-23,1\n")
+check("an unknown column stops the rewrite instead of guessing",
+      Service._fc_fix_header(stub, _hdr, _keys) is False)
+
 print("step 1's promise: this forecast cannot steer anything")
 src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "evcharge", "pv_forecast.py")).read()

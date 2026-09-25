@@ -763,6 +763,49 @@ class Service:
             "fetches": self.forecast.fetches, "failures": self.forecast.failures,
         }
 
+    def _fc_fix_header(self, csv_path: str, keys: list) -> bool:
+        """Keep the day record's header in step with its rows. True if it had to be rewritten.
+
+        The column set grows as the record learns (the rule columns arrived after the first two
+        days), and a CSV whose header no longer matches its rows is worse than useless for the
+        analysis it exists for - every later read would silently mis-assign columns, and a
+        header-based reader would drop the extra fields entirely. So when the key set changes,
+        the file is rewritten once with the new header and the old rows padded with empty
+        fields: nothing is dropped, and every column stays addressable by name.
+        """
+        try:
+            with open(csv_path, newline="") as fh:
+                rows = list(csv.reader(fh))
+        except (OSError, csv.Error) as exc:
+            LOG.warning("could not check the day record %s: %s", csv_path, exc)
+            return False
+        if not rows:
+            return False
+        head, rest = rows[0], rows[1:]
+        if head == keys:
+            return False
+        unknown = [c for c in head if c not in keys]
+        if unknown:
+            # Columns the app no longer knows about: rewriting would have to guess where their
+            # values belong. Leave the file alone and say so - a human should look at this.
+            LOG.warning("day record %s has columns this version does not know (%s) - left as is",
+                        csv_path, ", ".join(unknown))
+            return False
+        try:
+            tmp = csv_path + ".tmp"
+            with open(tmp, "w", newline="") as fh:
+                writer = csv.writer(fh, lineterminator="\n")
+                writer.writerow(keys)
+                for old in rest:
+                    writer.writerow(old + [""] * max(0, len(keys) - len(old)))
+            os.replace(tmp, csv_path)
+            LOG.info("day record: column set changed - header rewritten to %d columns, %d old "
+                     "row(s) padded with empty fields", len(keys), len(rest))
+            return True
+        except OSError as exc:
+            LOG.warning("could not rewrite the header of %s: %s", csv_path, exc)
+            return False
+
     def _fc_flush(self, final: bool) -> None:
         row = self._fc_row(final)
         if row is None:
@@ -783,10 +826,15 @@ class Service:
         csv_path = os.path.expanduser(str(self._fc_cfg.get("csv") or "logs/pv_forecast.csv"))
         try:
             os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+            keys = list(row.keys())
             fresh = not os.path.exists(csv_path)
+            if not fresh:
+                # The column set grows as the record learns; a stale header would make the file
+                # unreadable by name for exactly the analysis it exists for.
+                fresh = self._fc_fix_header(csv_path, keys)
             with open(csv_path, "a") as fh:
                 if fresh:
-                    fh.write(",".join(row.keys()) + "\n")
+                    fh.write(",".join(keys) + "\n")
                 fh.write(",".join("" if v is None else str(v) for v in row.values()) + "\n")
             LOG.info("PV day closed: forecast %.1f kWh | measured AC %.1f kWh (factor %s) | "
                      "array %.1f kWh | house %.1f kWh | car %.1f kWh | battery +%.1f/-%.1f kWh | "
