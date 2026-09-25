@@ -435,7 +435,7 @@ check("...with one, the day's delta is the difference",
 _grade = Service._fc_row(stub, False)
 check("...and the day's row carries all four fields (car_kwh next to the meter)",
       all(k in _grade for k in ("sdm_import_kwh", "sdm_export_kwh", "sdm_import_day_kwh",
-                                "sdm_export_day_kwh", "car_kwh")), sorted(_grade))
+                                "sdm_export_day_kwh", "car_kwh")), ", ".join(sorted(_grade)))
 
 
 class _Kaputt:
