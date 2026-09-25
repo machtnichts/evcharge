@@ -193,6 +193,7 @@ stub = types.SimpleNamespace(_fc_cfg={"csv": os.path.join(tmp, "pv.csv"),
                              state={}, _fc_best=None)
 stub._fc_blank = lambda day: Service._fc_blank(stub, day)      # unbound helpers, instance-shape
 stub._fc_row = lambda final: Service._fc_row(stub, final)
+stub._fc_sdm_daily = lambda: Service._fc_sdm_daily(stub)       # same reason: bound by hand
 Service._fc_reset(stub, DAY)
 site = SiteState(pv_power_w=4500.0, inverter_ac_w=4000.0, grid_power_w=-1000.0,
                  battery_power_w=-2000.0, battery_soc=52.0)
