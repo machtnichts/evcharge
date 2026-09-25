@@ -394,14 +394,17 @@ print("the day record's header: it must follow the columns, not lag behind")
 _hdr = os.path.join(tmp, "ragged.csv")
 with open(_hdr, "w") as _fh:
     _fh.write("row,date,se_production_kwh\nfinal,2026-09-23,29.371\n")
-_keys = ["row", "date", "se_production_kwh", "best30_kwh", "rule_best_says"]
-check("a matching header is left alone", Service._fc_fix_header(stub, _hdr, _keys[:3]) is False)
+# A column inserted in the MIDDLE is the hard case: padding at the end would shift 29.371 into
+# "best30_kwh" and lose it from where it belongs.
+_keys = ["row", "date", "best30_kwh", "se_production_kwh", "rule_best_says"]
+check("a matching header is left alone",
+      Service._fc_fix_header(stub, _hdr, ["row", "date", "se_production_kwh"]) is False)
 check("a grown column set rewrites the header once",
       Service._fc_fix_header(stub, _hdr, _keys) is True)
 _lines = open(_hdr).read().strip().split("\n")
 check("...the header now matches the columns", _lines[0] == ",".join(_keys), _lines[0])
-check("...and the old row survives, padded - nothing is dropped",
-      _lines[1] == "final,2026-09-23,29.371,,", _lines[1])
+check("...and the old row keeps its values under the RIGHT names (mapped, not padded)",
+      _lines[1] == "final,2026-09-23,,29.371,", _lines[1])
 check("...a second call changes nothing (no rewrite loop)",
       Service._fc_fix_header(stub, _hdr, _keys) is False)
 with open(_hdr, "w") as _fh:

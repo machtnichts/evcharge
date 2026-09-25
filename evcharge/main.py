@@ -793,14 +793,18 @@ class Service:
             return False
         try:
             tmp = csv_path + ".tmp"
+            # Map every old row by ITS OWN header. The new columns are not appended at the end -
+            # cloud cover and the forecast split landed in the middle of the key order - so
+            # padding at the end would shift each value to the wrong name, which is exactly the
+            # bug this method exists to prevent.
+            fixed = [[dict(zip(head, old)).get(key, "") for key in keys] for old in rest]
             with open(tmp, "w", newline="") as fh:
                 writer = csv.writer(fh, lineterminator="\n")
                 writer.writerow(keys)
-                for old in rest:
-                    writer.writerow(old + [""] * max(0, len(keys) - len(old)))
+                writer.writerows(fixed)
             os.replace(tmp, csv_path)
             LOG.info("day record: column set changed - header rewritten to %d columns, %d old "
-                     "row(s) padded with empty fields", len(keys), len(rest))
+                     "row(s) mapped by name", len(keys), len(rest))
             return True
         except OSError as exc:
             LOG.warning("could not rewrite the header of %s: %s", csv_path, exc)
