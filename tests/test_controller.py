@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from evcharge.controller import (ChargingController, Settings, MODE_PV, MODE_MINPV, MODE_NOW,
-                                MODE_OFF, MODE_MANUAL, MODE_CHEAP)
+from evcharge.controller import (ChargingController, Settings, Decision, MODE_PV, MODE_MINPV,
+                                MODE_NOW, MODE_OFF, MODE_MANUAL, MODE_CHEAP)
 from evcharge.drivers.solaredge import SiteState
 from evcharge.drivers.goe import ChargerState
 
@@ -48,8 +48,8 @@ def car(connected=True, charging=False, power=0, max_current=0, enabled=None):
     return c
 
 
-def dec(ctrl, s, c, **kw):
-    return ctrl.decide(s, c, now=datetime(2026, 9, 12, 14, 0), session_kwh=kw.get("session", 0.0))
+def dec(ctrl, s, c):
+    return ctrl.decide(s, c, now=datetime(2026, 9, 12, 14, 0))
 
 
 print("mode off")
@@ -258,15 +258,30 @@ d = w.decide(site(grid=-3000, soc=95), car(connected=False), now=night)
 check("cheap_hours mode does not charge with no vehicle",
       d.charge is False and "no vehicle" in d.reason, d.reason)
 
-print("plan: charge 10 kWh by a deadline")
-c = ChargingController(Settings(mode=MODE_PV, plan_energy_kwh=10, plan_deadline="18:00",
-                               enable_delay_s=0, disable_delay_s=0, buffer_soc=80))
-d = c.decide(site(grid=-100, soc=95), car(connected=True), now=datetime(2026, 9, 12, 14, 0),
-             session_kwh=0)
-check("plan overrides solar shortfall", d.charge and d.plan_active, d.reason)
-d = c.decide(site(grid=-100, soc=95), car(connected=True), now=datetime(2026, 9, 12, 14, 0),
-             session_kwh=10)
-check("plan inactive once energy delivered", d.plan_active is False, d.reason)
+print("the deadline plan is gone (removed 03.10.2026 on the owner's request)")
+# It was reachable only in pv / minpv / cheap_hours-outside-the-window: every branch above it
+# (manual, off, now, no vehicle, the stale gate, the cheap window) returns first. And while it
+# waited for a distant deadline it *suppressed a good solar surplus* - measured: 3 kW on offer,
+# pv mode, 13 A without a plan and 0 A with one. He does not need it, so it is out. Pinned the
+# way the forecast pin is: the module must not know the vocabulary at all, so it cannot creep
+# back in through a rename.
+import dataclasses  # noqa: E402
+import re as _re     # noqa: E402
+
+_plan_knobs = [f.name for f in dataclasses.fields(Settings) if "plan" in f.name]
+_plan_fields = [f.name for f in dataclasses.fields(Decision) if "plan" in f.name]
+check("Settings has no plan knob any more", _plan_knobs == [], str(_plan_knobs))
+check("Decision has no plan field any more", _plan_fields == [], str(_plan_fields))
+_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "evcharge", "controller.py"), encoding="utf-8").read()
+# \b so "plant"/"plant_now" do not trip it - the module is full of those on purpose.
+_stray = _re.search(r"\bplan\b", _src.lower())
+check("the controller source never says the word again",
+      _stray is None, _src[max(0, _stray.start() - 30):_stray.end() + 30] if _stray else "")
+check("...and the plan helpers went with it",
+      "_plan_required_w" not in _src and "_plan_start_in_s" not in _src)
+check("decide() takes no session energy any more",
+      "session_kwh" not in __import__("inspect").signature(ChargingController.decide).parameters)
 
 print("safety: hardware actions require control_enabled")
 c = ChargingController(Settings(mode=MODE_PV, control_enabled=False, enable_delay_s=0))
@@ -326,24 +341,24 @@ h = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, pha
                                 enable_delay_s=60, disable_delay_s=180, buffer_soc=80))
 cs = car(connected=True, charging=True, power=1380, max_current=6)
 t0 = datetime(2026, 9, 12, 14, 0)
-d = h.decide(site(grid=+800, soc=95), cs, now=t0, session_kwh=0)
+d = h.decide(site(grid=+800, soc=95), cs, now=t0)
 check("surplus collapses -> charge continues, timer starts", d.charge is True, d.reason)
-d = h.decide(site(grid=-3000, soc=95), cs, now=datetime(2026, 9, 12, 14, 2), session_kwh=0)
+d = h.decide(site(grid=-3000, soc=95), cs, now=datetime(2026, 9, 12, 14, 2))
 check("kettle finished after 2 min -> never stopped", d.charge is True and "waiting disable" not in d.reason,
       d.reason)
 h2 = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
                                  enable_delay_s=60, disable_delay_s=180, buffer_soc=80))
-d = h2.decide(site(grid=+800, bat=0, soc=70), cs, now=t0, session_kwh=0)
-d = h2.decide(site(grid=+800, bat=0, soc=70), cs, now=datetime(2026, 9, 12, 14, 4), session_kwh=0)
+d = h2.decide(site(grid=+800, bat=0, soc=70), cs, now=t0)
+d = h2.decide(site(grid=+800, bat=0, soc=70), cs, now=datetime(2026, 9, 12, 14, 4))
 check("no surplus for 4 min -> stops after the grace period", d.charge is False, d.reason)
 h3 = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
                                  enable_delay_s=60, disable_delay_s=180, buffer_soc=80))
 idle = car(connected=True)
-d = h3.decide(site(grid=-3000, soc=95), idle, now=t0, session_kwh=0)
+d = h3.decide(site(grid=-3000, soc=95), idle, now=t0)
 check("surplus appears -> enable delay holds the start", d.charge is False and "enable delay" in d.reason,
       d.reason)
-d = h3.decide(site(grid=+800, soc=95), idle, now=datetime(2026, 9, 12, 14, 1), session_kwh=0)
-d = h3.decide(site(grid=-3000, soc=95), idle, now=datetime(2026, 9, 12, 14, 2), session_kwh=0)
+d = h3.decide(site(grid=+800, soc=95), idle, now=datetime(2026, 9, 12, 14, 1))
+d = h3.decide(site(grid=-3000, soc=95), idle, now=datetime(2026, 9, 12, 14, 2))
 check("surplus back within the enable delay -> timer restarts, no charge", d.charge is False, d.reason)
 
 print("control edges use the box's permission (alw), not the car's draw")
@@ -414,38 +429,32 @@ check("from priority SOC up its 300 W intake is handed to the car (1.3 A more)",
       "%.0f W -> %.2f A vs %.2f A" % (above_chg.surplus_w, above_chg.target_current,
                                      above_flat.target_current))
 
-print("a deadline charge with time to spare waits instead of finishing early")
+print("nothing waits for a deadline: the sun is used, and no charge is invented without one")
+# The two scenarios that used to live here described the plan. What is left is the honest
+# behaviour without it, and it is worth pinning in both directions: a good surplus is taken at
+# once (nothing holds it back any more), and a thin one does not become a charge out of thin air.
 c = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
-                                enable_delay_s=60, disable_delay_s=180, buffer_soc=80,
-                                plan_energy_kwh=2.0, plan_deadline="18:00"))
+                                enable_delay_s=0, disable_delay_s=180, buffer_soc=80))
 pm = datetime(2026, 9, 12, 14, 0)
-d = c.decide(site(grid=-100, bat=0, soc=100), car(connected=True), now=pm, session_kwh=0.0)
-check("2 kWh by 18:00 is under 6 A -> hold off, do not finish hours early",
-      d.charge is False and d.plan_wait and "holding off" in d.reason, d.reason)
-check("the wait is published for the countdown (~2.5 h of it)",
-      abs(d.enable_in_s - 9183) < 120, "%.0f s" % d.enable_in_s)
-
-print("a deadline that needs the minimum or more charges now - on the sun if offered")
-c = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
-                                enable_delay_s=0, disable_delay_s=180, buffer_soc=80,
-                                plan_energy_kwh=6.0, plan_deadline="18:00"))
-d = c.decide(site(grid=-3000, bat=0, soc=100), car(connected=True), now=pm, session_kwh=0.0)
-check("6 kWh by 18:00 needs 1500 W, 3 kW of sun is on offer -> follow the sun",
-      d.charge and d.plan_active and abs(d.target_current - 13.0) < 0.2,
-      "%.1f A  %s" % (d.target_current, d.reason))
+d = c.decide(site(grid=-3000, bat=0, soc=100), car(connected=True), now=pm)
+check("3 kW of sun is taken at once - 13 A, no waiting",
+      d.charge and abs(d.target_current - 13.0) < 0.2, "%.1f A  %s" % (d.target_current, d.reason))
+d = c.decide(site(grid=-100, bat=0, soc=100), car(connected=True), now=pm)
+check("100 W of surplus still does not start a charge", d.charge is False, d.reason)
+check("...and nothing reports a wait", d.enable_in_s == 0.0, "%.0f s" % d.enable_in_s)
 
 print("phases are remembered while the car stays plugged in")
 c = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
                                 enable_delay_s=0, disable_delay_s=0, buffer_soc=80))
 cs3p = car(connected=True, charging=True, power=4000, max_current=6)
 cs3p.phases = 3
-c.decide(site(grid=-3000, bat=0, soc=100), cs3p, now=pm, session_kwh=0.0)
+c.decide(site(grid=-3000, bat=0, soc=100), cs3p, now=pm)
 cs_idle = car(connected=True)          # same cable, charge stopped, nothing flowing
-d = c.decide(site(grid=-3000, bat=0, soc=100), cs_idle, now=pm, session_kwh=0.0)
+d = c.decide(site(grid=-3000, bat=0, soc=100), cs_idle, now=pm)
 check("a 3-phase charge is remembered for the next decision", "3p)" in d.reason, d.reason)
 unplugged = car(connected=False)
-c.decide(site(grid=-3000, bat=0, soc=100), unplugged, now=pm, session_kwh=0.0)
-d = c.decide(site(grid=-3000, bat=0, soc=100), cs_idle, now=pm, session_kwh=0.0)
+c.decide(site(grid=-3000, bat=0, soc=100), unplugged, now=pm)
+d = c.decide(site(grid=-3000, bat=0, soc=100), cs_idle, now=pm)
 check("unplugging drops the memory back to the configured 1 phase", "(1p)" in d.reason, d.reason)
 
 print("the grace countdown is published for the web UI")
@@ -455,8 +464,8 @@ c = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, pha
 cs_g = car(connected=True, charging=True, power=2000, max_current=14)
 cs_g.phases = 1
 dip_site = site(pv=0, grid=2500, bat=0, soc=100)
-g1 = c.decide(dip_site, cs_g, now=datetime(2026, 9, 12, 14, 0), session_kwh=0.0)
-g2 = c.decide(dip_site, cs_g, now=datetime(2026, 9, 12, 14, 1), session_kwh=0.0)
+g1 = c.decide(dip_site, cs_g, now=datetime(2026, 9, 12, 14, 0))
+g2 = c.decide(dip_site, cs_g, now=datetime(2026, 9, 12, 14, 1))
 check("disable grace publishes the seconds left, counting down",
       g1.disable_in_s == 180.0 and g2.disable_in_s == 120.0,
       "%.0f s then %.0f s" % (g1.disable_in_s, g2.disable_in_s))
@@ -474,7 +483,7 @@ c = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, pha
                                 control_enabled=True, min_change_interval_s=0,
                                 site_stale_s=600))
 stale_h = 11 * 3600.0
-d = c.decide(site(grid=-3000, soc=95), car(connected=True), now=pm, session_kwh=0.0,
+d = c.decide(site(grid=-3000, soc=95), car(connected=True), now=pm,
              site_stale_s=stale_h)
 check("11 h old reading -> no charge, and the reason says why",
       d.charge is False and "stale" in d.reason, d.reason)
@@ -486,7 +495,7 @@ running.enabled = True
 acts_stale = c.hardware_actions(d, running, site_stale_s=stale_h)
 check("a blind meter still stops a running charge - and never re-limits it",
       acts_stale == ["alw=0"], str(acts_stale))
-d = c.decide(site(grid=-3000, soc=95), car(connected=True), now=pm, session_kwh=0.0,
+d = c.decide(site(grid=-3000, soc=95), car(connected=True), now=pm,
              site_stale_s=300.0)
 check("5 min of staleness is inside the tolerance -> normal sun tracking",
       d.charge and d.target_current > 12.0, d.reason)
@@ -507,7 +516,7 @@ writes, last = [], None
 for i in range(10):
     last = h.decide(site(pv=4000, grid=-2000, bat=0, soc=95), box_on_full,
                     now=datetime(2026, 9, 12, 15, 0, 0) + timedelta(seconds=30 * i),
-                    session_kwh=0.0)
+                    )
     writes += h.hardware_actions(last, box_on_full)
 check("ten cycles with a plugged, idle car write no switching at all",
       not any(w.startswith("alw=") for w in writes), writes)
@@ -522,13 +531,13 @@ h = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, pha
                                 control_enabled=True))
 box_off = car(connected=True, charging=False, enabled=False)
 d1 = h.decide(site(pv=6000, grid=-2000, bat=0, soc=95), box_off,
-              now=datetime(2026, 9, 12, 16, 0, 0), session_kwh=0.0)
+              now=datetime(2026, 9, 12, 16, 0, 0))
 w1 = h.hardware_actions(d1, box_off)
 check("nothing at all is written while the start is held back", w1 == [], w1)
 check("the decision reports the wait", d1.charge is False and "waiting enable delay" in d1.reason,
       d1.reason)
 d2 = h.decide(site(pv=6000, grid=-2000, bat=0, soc=95), box_off,
-              now=datetime(2026, 9, 12, 16, 1, 1), session_kwh=0.0)
+              now=datetime(2026, 9, 12, 16, 1, 1))
 w2 = h.hardware_actions(d2, box_off)
 check("after the grace the current limit goes first, then the enable",
       len(w2) >= 2 and w2[0].startswith("amx=") and w2[-1] == "alw=1", w2)
@@ -544,13 +553,13 @@ drawing.phases = 1
 # SOC below the buffer on purpose: above it the house battery deliberately *carries*
 # the car at the minimum instead of stopping (its own rule), which would hide the grace.
 d1 = h.decide(site(pv=0, grid=600, bat=0, soc=70), drawing,
-              now=datetime(2026, 9, 12, 17, 0, 0), session_kwh=0.0)
+              now=datetime(2026, 9, 12, 17, 0, 0))
 w1 = h.hardware_actions(d1, drawing)
 check("surplus 800 W while drawing: the charge is held, not cut",
       d1.charge is True and "waiting disable" in d1.reason, d1.reason)
 check("...and nothing is written in the meantime", w1 == [], w1)
 d2 = h.decide(site(pv=0, grid=600, bat=0, soc=70), drawing,
-              now=datetime(2026, 9, 12, 17, 3, 1), session_kwh=0.0)
+              now=datetime(2026, 9, 12, 17, 3, 1))
 w2 = h.hardware_actions(d2, drawing)
 check("after 180 s the decision stops - and exactly one alw=0 goes out",
       d2.charge is False and w2 == ["alw=0"], "%s | %s" % (d2.reason, w2))
@@ -564,11 +573,11 @@ h = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, pha
                                 enable_threshold_w=300, disable_threshold_w=300))
 box_off = car(connected=True, charging=False, enabled=False)
 d = h.decide(site(pv=1400, grid=-1400, bat=0, soc=95), box_off,
-             now=datetime(2026, 9, 12, 18, 0, 0), session_kwh=0.0)
+             now=datetime(2026, 9, 12, 18, 0, 0))
 check("1400 W is above the minimum but must not open a session (needs 1680 W)",
       d.charge is False, d.reason)
 d = h.decide(site(pv=1700, grid=-1700, bat=0, soc=95), box_off,
-             now=datetime(2026, 9, 12, 18, 1, 0), session_kwh=0.0)
+             now=datetime(2026, 9, 12, 18, 1, 0))
 check("1700 W does open one, at 7.4 A", d.charge is True and abs(d.target_current - 7.4) < 0.2,
       d.reason)
 h2 = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, phases=1,
@@ -577,13 +586,13 @@ h2 = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, ph
 holding = car(connected=True, charging=True, power=1380, enabled=True, max_current=6)
 holding.phases = 1
 d = h2.decide(site(pv=0, grid=100, bat=0, soc=70), holding,
-              now=datetime(2026, 9, 12, 18, 2, 0), session_kwh=0.0)
+              now=datetime(2026, 9, 12, 18, 2, 0))
 check("1280 W does not end a running charge (the hold floor is 1080 W)",
       d.charge is True, d.reason)
 check("...it holds at the minimum instead of dropping to zero",
       d.target_current == 6.0, "%.1f A" % d.target_current)
 d = h2.decide(site(pv=0, grid=600, bat=0, soc=70), holding,
-              now=datetime(2026, 9, 12, 18, 3, 0), session_kwh=0.0)
+              now=datetime(2026, 9, 12, 18, 3, 0))
 check("800 W is below the hold floor, so the decision stops", d.charge is False, d.reason)
 
 print("the owner's own margins: start +100 W, hold -300 W (21.09.2026)")
@@ -595,15 +604,15 @@ h3 = ChargingController(Settings(mode=MODE_PV, min_current=6, max_current=14, ph
                                  enable_threshold_w=100, disable_threshold_w=300))
 box_off3 = car(connected=True, charging=False, enabled=False)
 d = h3.decide(site(pv=1400, grid=-1400, bat=0, soc=70), box_off3,
-              now=datetime(2026, 9, 21, 9, 0, 0), session_kwh=0.0)
+              now=datetime(2026, 9, 21, 9, 0, 0))
 check("1400 W is above the minimum but below minimum+100 W -> no start", d.charge is False, d.reason)
 d = h3.decide(site(pv=1500, grid=-1500, bat=0, soc=70), box_off3,
-              now=datetime(2026, 9, 21, 9, 1, 0), session_kwh=0.0)
+              now=datetime(2026, 9, 21, 9, 1, 0))
 check("1500 W is past the +100 W margin -> it starts", d.charge is True, d.reason)
 holding3 = car(connected=True, charging=True, power=1380, enabled=True, max_current=6)
 holding3.phases = 1
 d = h3.decide(site(pv=0, grid=100, bat=0, soc=70), holding3,
-              now=datetime(2026, 9, 21, 9, 2, 0), session_kwh=0.0)
+              now=datetime(2026, 9, 21, 9, 2, 0))
 check("...and 1280 W holds a charge that is already running (down to -300 W)",
       d.charge is True and d.target_current == 6.0, d.reason)
 

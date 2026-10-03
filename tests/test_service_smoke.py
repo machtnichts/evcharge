@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from evcharge.main import Service, UI_HTML  # noqa: E402
+from evcharge.main import Service, UI_HTML, ADDON_OPTION_MAP  # noqa: E402
 
 FAILS = []
 
@@ -86,6 +86,50 @@ try:
 except Exception as exc:  # noqa: BLE001
     check("no proxy_status block: enabled by default", False, "%s: %s" % (type(exc).__name__, exc))
 
+print("a settings change is visible in the state snapshot at once")
+# The mode badge, the highlighted mode button and the enable/disable (DRY RUN) label all
+# read state["mode"] / state["control_enabled"], and the loop is the only other place that
+# refreshes them - once per cycle, measured at ~32 s on the live service (interval_s 30
+# plus the cycle's own work). When update_settings only wrote state["settings"], a click
+# in the web UI looked like it had done nothing until that cycle came round, which is how
+# a working button gets pressed twice (the log shows exactly that: the same mode written
+# twice, seconds apart). Nothing here touches a device - the drivers are stubs.
+if svc is not None:
+    from evcharge.drivers.goe import ChargerState
+    from evcharge.drivers.solaredge import SiteState
+
+    for _attr in ("garage", "proxy_status", "session_meter", "forecast"):
+        setattr(svc, _attr, None)
+
+    class _StubCharger:
+        def status(self):
+            return ChargerState(connected=False)
+
+        def set_charging(self, on):
+            pass
+
+        def set_max_current(self, amps):
+            pass
+
+    class _StubSite:
+        def read(self):
+            return SiteState(grid_power_w=120.0, battery_soc=70.0)
+
+    svc.charger, svc.site = _StubCharger(), _StubSite()
+    svc.cycle()                                  # the first cycle, as at startup
+    svc.update_settings({"mode": "manual", "control_enabled": False})
+    check("mode is in the snapshot right after the change",
+          svc.state.get("mode") == "manual", str(svc.state.get("mode")))
+    check("the control flag is in the snapshot right after the change",
+          svc.state.get("control_enabled") is False, str(svc.state.get("control_enabled")))
+    check("state['settings'] agrees with it (what the /api/settings replay reads)",
+          (svc.state.get("settings") or {}).get("mode") == "manual")
+    check("and the cycle still publishes the same answer, not a different one",
+          svc.cycle() is None and svc.state.get("mode") == "manual")
+    check("an unknown mode is still refused, settings untouched",
+          svc.update_settings({"mode": "nonsense"}).get("ok") is False
+          and svc.state.get("mode") == "manual")
+
 print("the web UI's own script parses")
 # The page is one JavaScript block inside a Python triple-quoted string, so a backslash-n
 # or an unbalanced quote in the source becomes a broken script in the browser - and a
@@ -108,6 +152,28 @@ else:
     res = _sp.run([_node, "--check", path], capture_output=True, text=True)
     detail = (res.stderr.strip().splitlines() or [""])[0][:120] if res.returncode else ""
     check("the served script is syntactically valid JS", res.returncode == 0, detail)
+
+# Pinned on the source, because this failure is invisible to the server: the page polls the
+# state every 3 s and used to write every settings field from it unconditionally, so a value
+# typed into an input ("plan kWh: 1") was back to the stored one before the Save button could
+# be reached - measured on the live page: 1 -> 0 within 4 s. The fill must skip a field that
+# is focused or marked dirty, and the save must clear the mark so the field follows the
+# server again (a rejected value then visibly comes back instead of looking saved).
+check("the settings fill keeps its hands off a field being edited",
+      'el===document.activeElement||el.dataset.dirty==="1"' in UI_HTML)
+check("a keystroke marks the field and a save clears the mark",
+      'addEventListener("input",()=>{el.dataset.dirty="1";})' in UI_HTML
+      and "clearDirtySettings();" in UI_HTML)
+check("no unconditional settings fill is left in the page",
+      'const el=document.getElementById("set_"+k); if(el&&st[k]!==undefined) el.value=' not in UI_HTML)
+# The deadline plan was removed on the owner's request (03.10.2026) - fields, countdown text
+# and add-on options alike. Pinned on the served page and the option map, because a leftover
+# input would sit there looking editable while the setting no longer exists.
+check("the settings card has no plan fields left",
+      "set_plan_energy_kwh" not in UI_HTML and "set_plan_deadline" not in UI_HTML)
+check("the countdown says nothing about a plan any more", "plan:" not in UI_HTML)
+check("no add-on option maps plan keys any more",
+      "plan_energy_kwh" not in str(ADDON_OPTION_MAP) and "plan_deadline" not in str(ADDON_OPTION_MAP))
 
 print()
 if FAILS:

@@ -121,7 +121,8 @@ and steers nothing**, because the owner wants to judge it against his own roof f
 
 The app reads the SolarEdge through the proxy and never writes to it: the house battery belongs
 to the inverter, and the owner's rule is that this app does not steer it ("Ich will nicht Akku
-steuern"). So the Modbus client has no write method at all and the site driver has nothing that
+steuern" - I do not want to control the battery). So the Modbus client has no write method at
+all and the site driver has nothing that
 touches the storage registers - both were removed, and `tests/test_solaredge_decode.py` pins it
 structurally: no write method on the client, nothing battery-steering on the driver, and the
 control/limit register addresses must not reappear in the code.

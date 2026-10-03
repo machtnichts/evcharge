@@ -8,7 +8,7 @@ Entities published (all under the configured discovery prefix):
     sensor  pv_power, grid_power, battery_power, battery_soc, ev_power,
             ev_energy_grid_import, ev_energy_grid_export, ev_current, ev_surplus
     select  mode            (off / now / minpv / pv)
-    number  max_current, min_current, buffer_soc, priority_soc, plan_energy_kwh
+    number  max_current, min_current, buffer_soc, priority_soc
     binary_sensor  charging
     switch  control_enabled
 """
@@ -244,8 +244,7 @@ class HomeAssistantMqtt:
         for oid, name, unit in (("max_current", "EV max current", "A"),
                                 ("min_current", "EV min current", "A"),
                                 ("buffer_soc", "Battery buffer SOC", "%"),
-                                ("priority_soc", "Battery priority SOC", "%"),
-                                ("plan_energy_kwh", "Charge plan energy", "kWh")):
+                                ("priority_soc", "Battery priority SOC", "%")):
             self._entity("number", oid, name, {
                 "value_template": "{{ value_json.settings.%s }}" % oid,
                 "command_topic": _topic(self.prefix, "set", oid),
@@ -259,7 +258,7 @@ class HomeAssistantMqtt:
 
     # -- commands --------------------------------------------------------
     NUMERIC = ("min_current", "max_current", "buffer_soc", "priority_soc",
-               "plan_energy_kwh", "enable_threshold_w", "residual_power_w")
+               "enable_threshold_w", "residual_power_w")
 
     def handle_command(self, topic: str, payload: str) -> None:
         prefix = _topic(self.prefix, "set") + "/"
@@ -280,8 +279,6 @@ class HomeAssistantMqtt:
                 self.svc.update_settings({key: float(payload)})
             elif key == "cheap_hours":
                 self.svc.update_settings({"cheap_hours": payload})
-            elif key == "plan_deadline":
-                self.svc.update_settings({"plan_deadline": payload})
             else:
                 LOG.warning("unknown command topic %s", topic)
         except (TypeError, ValueError) as exc:

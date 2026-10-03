@@ -160,5 +160,11 @@ _bool_ok = ("{{ 'ON' if value_json.charger.charging else 'OFF' }}" in _mqtt_src
             and "{{ 'true' if value_json.control_enabled else 'false' }}" in _mqtt_src)
 print("  boolean templates spelled out        %s" % ("PASS" if _bool_ok else "FAIL"))
 expected = expected and _bool_ok
+# The deadline plan was removed on the owner's request (03.10.2026). It used to be published
+# as a HA number entity and accepted on set/plan_deadline; a leftover here would leave an
+# entity in Home Assistant that writes into a setting the app no longer has.
+_no_plan = ("plan_energy_kwh" not in _mqtt_src and "plan_deadline" not in _mqtt_src)
+print("  no plan entity or command left       %s" % ("PASS" if _no_plan else "FAIL"))
+expected = expected and _no_plan
 print("\nRESULT: %s" % ("ALL PASS" if expected else "FAILURES PRESENT"))
 sys.exit(0 if expected else 1)

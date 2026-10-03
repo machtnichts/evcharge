@@ -4,7 +4,7 @@ The proxy is the single Modbus client for the inverter; this driver just reads
 cached registers from it. **It is read-only, deliberately and provably:**
 
 * the inverter owns the house battery, and the owner's rule is that this app must
-  not touch it ("Ich will nicht Akku steuern") - so the battery-control calls that
+  not touch it ("Ich will nicht Akku steuern" - I do not want to control the battery) - so the battery-control calls that
   once sat here (storage mode 0xE00D, discharge limit 0xE010) and the export-limit
   constants (0xE000..0xE002) are gone, together with the Modbus write primitives;
 * `tests/test_solaredge_decode.py` pins that structurally - no write method on the

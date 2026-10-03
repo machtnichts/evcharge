@@ -74,7 +74,7 @@ def summary(stats, now=None, failures=0):
         "uptime_s": _f(s.get("uptime_s")),
         "last_error": str(s.get("last_upstream_error") or ""),
     })
-    # How long ago the last error happened, for "vor 15 min" in the UI. Exact times live
+    # How long ago the last error happened, for the "15 min ago" in the UI. Exact times live
     # in the proxy's log; a rough age is what tells you whether it still matters.
     at = _f(s.get("last_upstream_error_at"))
     out["last_error_at"] = at or None

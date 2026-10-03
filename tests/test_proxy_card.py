@@ -84,7 +84,7 @@ for key in ("level", "text", "ok_age_s", "backoff_s", "errors", "reconnects", "t
 check("summary counts add up", s["reads"] == 40 and s["misses"] == 56, str((s["reads"], s["misses"])))
 check("last error is carried verbatim", summary(stats(last_upstream_error="read: boom"), NOW)["last_error"] == "read: boom")
 
-print("the age of the last error, for \"vor 15 min\" in the UI")
+print("the age of the last error, for \"15 min ago\" in the UI")
 s_age = summary(stats(last_upstream_error="failed to fill whole buffer",
                       last_upstream_error_at=NOW - 900), NOW)
 check("900 s old reads as 900", s_age["last_error_age_s"] == 900.0, s_age["last_error_age_s"])

@@ -462,8 +462,8 @@ class PvForecast:
             supply = out["remaining_corrected_kwh"] - float(house_rest_kwh or 0.0)
             out["supply_after_house_kwh"] = round(supply, 2)
             out["would_be"] = "battery" if supply < need * margin else "car"
-            out["would_be_text"] = ("Akku-Vorrang (Rest reicht nicht)" if supply < need * margin
-                                    else "Auto-Vorrang (Rest reicht fuer den Akku)")
+            out["would_be_text"] = ("Battery priority (the rest is not enough)" if supply < need * margin
+                                    else "Car priority (the rest covers the battery)")
         out["parts"] = self.data.parts_kwh(date)
         # The owner's rule in its seasonal-relative form (rule_by_best), published NEXT TO the
         # older factor-based shadow verdict rather than instead of it: both go into the day's

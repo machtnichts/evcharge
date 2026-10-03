@@ -2,8 +2,8 @@
 
 Two things are checked here: that the arithmetic is right, and that the forecast *cannot*
 steer anything. The second is the promise step 1 makes to the owner ("erstmal sehen, wie es
-so ist"), so it is pinned structurally - the module has no actuator vocabulary and the
-controller never reads the forecast key.
+so ist" - first let us see how it behaves), so it is pinned structurally - the module has no
+actuator vocabulary and the controller never reads the forecast key.
 
 No network: the fetch is injected.
 """

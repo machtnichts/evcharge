@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Prueft die retained Discovery-Nachrichten der App und raeumt verwaiste auf.
+"""Audit the app's retained MQTT discovery messages and clear orphaned ones.
 
-HA legt aus jeder retained `.../config`-Nachricht eine Entitaet an. Bleibt eine alte Fassung
-im Broker liegen, bleibt ihre Entitaet in HA stehen - genau das war bei
-`binary_sensor.ev_charger_wt_ev_charge_control_enabled` der Fall (eine aeltere Version hatte
-dort einen binary_sensor statt eines switch).
+Home Assistant creates an entity from every retained `.../config` message. If an older version
+leaves its message in the broker, its entity stays in HA for ever - which is exactly what
+happened with `binary_sensor.ev_charger_wt_ev_charge_control_enabled` (an older version
+published a binary_sensor there instead of a switch).
 
-Ohne Argument: nur anzeigen. Mit `--aufraeumen`: alles loeschen, was nicht zum aktuellen Satz
-gehoert (leere Payload, retain=True).
+Without an argument: report only. With `--clean`: delete everything that does not belong to
+the current set (empty payload, retain=True).
 """
 import json
 import sys
@@ -15,46 +15,45 @@ import sys
 sys.path.insert(0, "/home/adermake/EV-CHARGER-WT-HA/ha-app")
 from evcharge.mqtt import MqttClient  # noqa: E402
 
-# Was die aktuelle Fassung anlegt (mqtt.py, publish_discovery):
-AKTUELL = {("sensor", o) for o in ("pv_power", "grid_power", "battery_power", "battery_soc",
-                                  "ev_power", "ev_current", "ev_surplus", "grid_import",
-                                  "grid_export", "session_energy")}
-AKTUELL |= {("binary_sensor", "charging"), ("select", "mode"), ("switch", "control_enabled")}
-AKTUELL |= {("number", o) for o in ("max_current", "min_current", "buffer_soc", "priority_soc",
-                                    "plan_energy_kwh")}
+# What the current version publishes (mqtt.py, publish_discovery):
+CURRENT = {("sensor", o) for o in ("pv_power", "grid_power", "battery_power", "battery_soc",
+                                   "ev_power", "ev_current", "ev_surplus", "grid_import",
+                                   "grid_export", "session_energy")}
+CURRENT |= {("binary_sensor", "charging"), ("select", "mode"), ("switch", "control_enabled")}
+CURRENT |= {("number", o) for o in ("max_current", "min_current", "buffer_soc", "priority_soc")}
 
 CFG = json.load(open("/home/adermake/EV-CHARGER-WT-HA/ha-app/config.json"))["mqtt"]
-PRAEFIX = CFG["discovery_prefix"] + "/+/evcharge_wt/+/config"
+PATTERN = CFG["discovery_prefix"] + "/+/evcharge_wt/+/config"
 c = MqttClient(host=CFG["host"], port=int(CFG["port"]), client_id=CFG["client_id"] + "-disc",
                user=CFG["user"], password=CFG["password"])
 c.connect()
-c.subscribe([PRAEFIX])
-gefunden = {}
+c.subscribe([PATTERN])
+found = {}
 for _ in range(60):
     pkt = c.read_packet(timeout=0.5)
     if pkt and pkt[0] == "publish":
-        gefunden[pkt[1]] = pkt[2] if isinstance(pkt[2], str) else pkt[2].decode("utf-8", "replace")
-print("retained Discovery-Nachrichten unter %s: %d" % (PRAEFIX, len(gefunden)))
-verwaist = []
-for topic in sorted(gefunden):
-    teile = topic.split("/")            # homeassistant / <kind> / evcharge_wt / <oid> / config
-    kind, oid = teile[1], teile[3]
-    drin = (kind, oid) in AKTUELL
-    if not drin:
-        verwaist.append(topic)
-    print("  %-58s %s" % ("%s/%s" % (kind, oid), "aktuell" if drin else "VERWAIST"))
+        found[pkt[1]] = pkt[2] if isinstance(pkt[2], str) else pkt[2].decode("utf-8", "replace")
+print("retained discovery messages under %s: %d" % (PATTERN, len(found)))
+orphans = []
+for topic in sorted(found):
+    parts = topic.split("/")           # homeassistant / <kind> / evcharge_wt / <oid> / config
+    kind, oid = parts[1], parts[3]
+    known = (kind, oid) in CURRENT
+    if not known:
+        orphans.append(topic)
+    print("  %-58s %s" % ("%s/%s" % (kind, oid), "current" if known else "ORPHANED"))
 print()
-if not verwaist:
-    print("nichts aufzuraeumen")
+if not orphans:
+    print("nothing to clean up")
     c.close()
     sys.exit(0)
-if "--aufraeumen" not in sys.argv:
-    print("Zum Loeschen erneut mit --aufraeumen aufrufen:")
-    for t in verwaist:
+if "--clean" not in sys.argv:
+    print("run again with --clean to delete:")
+    for t in orphans:
         print("  %s" % t)
     c.close()
     sys.exit(0)
-for t in verwaist:
+for t in orphans:
     c.publish(t, "", retain=True)
-    print("  geloescht (leer, retained): %s" % t)
+    print("  deleted (empty, retained): %s" % t)
 c.close()

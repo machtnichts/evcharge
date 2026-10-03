@@ -220,6 +220,11 @@ class Service:
         self._fc_best = None
         # The garage meter's counters at the last day's close, for the next day's delta.
         self._fc_sdm_prev = {}
+        # The garage PV counter's day baseline. Display only, and deliberately held apart from
+        # the inverter counter: the house battery is charged by the SolarEdge alone, so adding
+        # the garage would answer a different question than the row is about. The garage shows
+        # itself as a second number instead - the same way the PV power row shows "SE / garage".
+        self._garage_day = {"day": None, "start_kwh": None, "today_kwh": None, "partial": False}
         if self._fc_cfg.get("enabled"):
             settings_cfg = config.get("settings") or {}
             planes = [Plane(float(p.get("kwp", 0.0)), float(p.get("azimuth", 0.0)),
@@ -451,9 +456,7 @@ class Service:
         decision: Optional[Decision] = None
         actions = []
         if site_state is not None and charger_state is not None:
-            decision = self.controller.decide(site_state, charger_state,
-                                              session_kwh=self.state.get("session_kwh", 0.0),
-                                              site_stale_s=held)
+            decision = self.controller.decide(site_state, charger_state, site_stale_s=held)
             actions = self.controller.hardware_actions(decision, charger_state,
                                                        site_stale_s=held)
             if self.safety.fault:
@@ -560,6 +563,8 @@ class Service:
                                       goe_session_kwh=self.state.get("session_kwh", 0.0))
             with self._lock:
                 self.state["sdm"] = self.session_meter.as_state()
+            # Today's garage PV, as a second number next to the inverter's counter (display only).
+            self._garage_day_update(self.state["sdm"])
         # PV forecast (pv_forecast.py) - display and logging only, step 1 of the plan. Refresh
         # on its own cadence, add this cycle to the day's totals, keep today's row on disk.
         # Nothing in this block can reach a decision; if the internet is gone the module keeps
@@ -599,7 +604,7 @@ class Service:
                 self._fc_written_at = fc_ts
             with self._lock:
                 self.state["forecast"] = self.forecast.as_state(
-                    measured_today_kwh=self._fc["ac_kwh"],
+                    measured_today_kwh=self._fc["pv_kwh"],
                     soc=(site_state.battery_soc if site_state is not None else None),
                     soc_target=self.settings.priority_soc,
                     capacity_kwh=self._fc_capacity,
@@ -624,6 +629,13 @@ class Service:
     def _fc_blank(self, day: str) -> Dict:
         return {"day": day, "ac_kwh": 0.0, "array_kwh": 0.0, "house_kwh": 0.0,
                 "car_kwh": 0.0, "charge_kwh": 0.0, "discharge_kwh": 0.0,
+                # PV production, as opposed to the inverter's AC output above. The two differ by
+                # the battery: energy that goes into it is produced but not delivered, and energy
+                # that comes out of it is delivered but not produced. The forecast predicts
+                # *production*, so it must be compared against this, not against ac_kwh - with
+                # ac_kwh alone the factor sits low all day and drifts high again at night, when
+                # the counter keeps advancing without any sun.
+                "pv_kwh": 0.0,
                 "soc_min": None, "soc_max": None, "samples": 0,
                 # The inverter's lifetime counter, and the baseline it had when this day
                 # started. Kept in the day's own record so a restart resumes the same day.
@@ -661,12 +673,64 @@ class Service:
             d["charge_kwh"] += -batt * h
         else:
             d["discharge_kwh"] += batt * h
+        # PV production for the day: delivered energy plus what is now sitting in the battery,
+        # minus what the battery gave back. Over a day that is exactly what the roof produced,
+        # and it is the figure the forecast is about. Deliberately *not* used for the AC node
+        # above - there the inverter's output is already the whole story.
+        #
+        # Clamped at zero, and for the same reason the AC node is: at night the battery runs the
+        # house THROUGH the inverter, so the counter advances while nothing is produced and the
+        # sum goes a little negative. Production cannot be negative; a sign slip must not write
+        # one into the record. The forecast's own factor() still returns None for a flat day, so
+        # clamping cannot flatter it.
+        d["pv_kwh"] = max(0.0, d["ac_kwh"] + d["charge_kwh"] - d["discharge_kwh"])
         soc = getattr(site_state, "battery_soc", None)
         if soc is not None:
             soc = float(soc)
             d["soc_min"] = soc if d["soc_min"] is None else min(d["soc_min"], soc)
             d["soc_max"] = soc if d["soc_max"] is None else max(d["soc_max"], soc)
         d["samples"] += 1
+
+    def _garage_day_update(self, sdm_state: Optional[Dict]) -> None:
+        """Today's garage (Deye) PV from its own lifetime counter, published as a second number.
+
+        Display only, and deliberately **not** added to the inverter counter: the house battery
+        can only be charged by the SolarEdge, so a combined figure would answer a different
+        question than that row is about. The garage stands next to it instead - the same way the
+        PV power row shows "SE / garage".
+
+        The counter lives in Home Assistant (`sensor.garage_pv_energie`), so this cannot ride on
+        the forecast's day file; the baseline sits in memory and is re-latched after a restart.
+        That is why the figure carries a partial-day marker rather than pretending to be whole.
+        """
+        if not sdm_state:
+            return
+        now_kwh = sdm_state.get("pv_energy_kwh")
+        if now_kwh is None:
+            return
+        day = None
+        if self.forecast is not None:
+            day = self.forecast.hour_now[:10]
+        minutes = self._minutes_since_midnight()
+        g = self._garage_day
+        if day and g["day"] != day:
+            g.update({"day": day, "start_kwh": float(now_kwh), "today_kwh": None,
+                      "partial": bool(minutes is None or minutes > 30)})
+            LOG.info("garage PV day baseline latched at %.3f kWh (HA counter)%s",
+                     float(now_kwh),
+                     " (partial day - the baseline was not taken at the day's start)"
+                     if g["partial"] else "")
+            return
+        if g["start_kwh"] is None or float(now_kwh) < float(g["start_kwh"]):
+            g["start_kwh"] = float(now_kwh)      # a reset or a wrap must not invent a figure
+            g["today_kwh"] = None
+            return
+        g["today_kwh"] = round(float(now_kwh) - float(g["start_kwh"]), 3)
+        with self._lock:
+            self.state["garage_day"] = {"day_kwh": g["today_kwh"],
+                                        "counter_kwh": round(float(now_kwh), 3),
+                                        "partial": bool(g["partial"]),
+                                        "day": g["day"]}
 
     def _fc_se_latch(self, site_state, minutes_since_midnight=_UNSET) -> None:
         """Derive today's production from the inverter's lifetime AC counter.
@@ -736,7 +800,14 @@ class Service:
             "measured_array_kwh": round(d["array_kwh"], 3),
             # AC against the AC estimate, array (DC side) against the DC estimate - the two
             # factors answer different questions and must not be mixed.
-            "factor_ac": pv_factor(d["ac_kwh"], exp_sofar),
+            # The forecast predicts PV *production*; ac_kwh is what the inverter *delivered*.
+            # Differencing the two by the battery makes the factor honest: without it the day
+            # looks ~25 % worse than the roof did while the battery charges, and too good again
+            # at night. `factor_ac` keeps its name (the day file and the UI know it); the figure
+            # it describes is now the production.
+            "measured_pv_kwh": round(d["pv_kwh"], 3),
+            "factor_ac": pv_factor(d["pv_kwh"], exp_sofar),
+            "factor_ac_delivered": pv_factor(d["ac_kwh"], exp_sofar),
             "factor_array": pv_factor(d["array_kwh"], exp_sofar_dc),
             "house_kwh": round(d["house_kwh"], 3), "car_kwh": round(d["car_kwh"], 3),
             "battery_charge_kwh": round(d["charge_kwh"], 3),
@@ -909,6 +980,10 @@ class Service:
                         "car_kwh": float(row.get("car_kwh") or 0.0),
                         "charge_kwh": float(row.get("battery_charge_kwh") or 0.0),
                         "discharge_kwh": float(row.get("battery_discharge_kwh") or 0.0),
+                        # Restored from the row when it is there; older rows only know the AC
+                        # figure, which is the closest they can offer.
+                        "pv_kwh": float(row.get("measured_pv_kwh")
+                                        or row.get("measured_ac_kwh") or 0.0),
                         "soc_min": row.get("soc_min"), "soc_max": row.get("soc_max"),
                         "samples": int(row.get("samples") or 0),
                         "se_start_kwh": row.get("se_lifetime_start_kwh"),
@@ -1045,6 +1120,16 @@ class Service:
             self.settings.mode = MODE_PV
         with self._lock:
             self.state["settings"] = self.settings.to_dict()
+            # Publish the two fields the *buttons* are drawn from here as well, not only in
+            # cycle(). The mode badge, the highlighted mode button and the enable/disable
+            # (and DRY RUN) label all read state["mode"] / state["control_enabled"], and the
+            # loop is the only other place that copies them - once per cycle, measured at
+            # ~32 s (interval_s 30 + the cycle's own work). So a click used to look like it
+            # had done nothing until the next cycle came round, and the natural reaction to
+            # a button that does not react is to press it again. The decision itself was
+            # never stale - only the picture of it.
+            self.state["mode"] = self.settings.mode
+            self.state["control_enabled"] = self.settings.control_enabled
         LOG.info("settings updated: %s", {k: v for k, v in patch.items() if k in allowed})
         return {"ok": True, "unknown": unknown, "settings": self.settings.to_dict(),
                 **self._persist_settings()}
@@ -1126,9 +1211,9 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row"><span>surplus</span><span class="v" id="d_surplus">-</span></div>
   <div class="row"><span>reason</span><span class="v" id="d_reason">-</span></div>
   <div class="row" id="d_safety_row" style="display:none"><span>stops 30 min</span><span class="v" id="d_safety">-</span></div>
-  <button id="clearfault" style="display:none" title="Quittiert die Stoerung und gibt die
-    Wallbox wieder frei. Ein Neustart des Dienstes tut dasselbe - der Riegel lebt nur im
-    Speicher. Von selbst loest er sich nicht, solange die App laeuft.">Clear fault</button>
+  <button id="clearfault" style="display:none" title="Clears the fault and releases the
+    wallbox again. Restarting the service does the same - the latch only lives in memory.
+    It never clears itself while the app is running.">Clear fault</button>
   <div class="row" id="d_cheap_row" style="display:none"><span>cheap window</span><span class="v" id="d_cheap">-</span></div>
   <div class="row" id="d_blocked_row" style="display:none"><span>blocked by</span><span class="v warn" id="d_blocked">-</span></div>
   <div class="row" id="d_grace_row" style="display:none"><span>grace</span><span class="v warn" id="d_grace">-</span></div>
@@ -1141,12 +1226,12 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <div class="row" id="s_bat_row"><span>battery</span><span class="v" id="s_bat">-</span></div>
   <div class="row"><span>battery SOC</span><span class="v" id="s_soc">-</span></div>
   <div class="row"><span>imported / exported</span><span class="v" id="s_energy">-</span></div>
-  <div class="row" id="f_se_row" style="display:none" title="Der Lebensdauer-Zaehler des Wechselrichters (SunSpec WH) - genau die Zahl, die deine Monitoring-App als Produktion zeigt. Sie liegt im ohnehin gelesenen Registerfenster, kostet also keinen zusaetzlichen Modbus-Verkehr, und ist exakt: sie kann - anders als ein Integral aus Leistungsmessungen - nichts verlieren, waehrend der Dienst steht, und sie zaehlt die spaetere Akku-Entladung mit (fair: gezaehlt wird einmal, was der Wechselrichter abgegeben hat)."><span>PV produced today (counter)</span><span class="v" id="f_se">-</span></div>
-  <div class="row" id="f_day_row" style="display:none" title="Lokale PV-Prognose fuer das Dach (Open-Meteo, 14 Module Ost + 11 Module West, davon 5 auf dem Dach und 6 auf der flacheren Gaube) - die Prognose fuer heute. Das wird noch NICHT gesteuert: die Zahl wird nur angezeigt und taeglich mitgeloggt, damit wir sehen, ob so eine Prognose fuer dieses Dach taugt.">
+  <div class="row" id="f_se_row" style="display:none" title="The inverter's lifetime counter (SunSpec WH) as the day's difference. NOTE: this is NOT the PV production, it is what the inverter DELIVERED. The difference is the battery charge - it comes back once the battery discharges and is then counted too (fair: what the inverter delivered is counted once). To its right the garage (Deye) from Home Assistant - deliberately NOT added in, because only the SolarEdge can charge the house battery. The figure sits in the register window we read anyway, so it costs no extra Modbus traffic."><span>inverter output today / garage PV</span><span class="v" id="f_se">-</span></div>
+  <div class="row" id="f_day_row" style="display:none" title="Local PV forecast for the roof (Open-Meteo, 14 modules east + 11 modules west, 5 of them on the roof and 6 on the shallower dormer) - the forecast for today. This still steers NOTHING: the figure is only displayed and logged once a day, so we can see whether a forecast like this is any good for this roof.">
     <span>PV forecast today</span><span class="v" id="f_day">-</span></div>
   <div class="row" id="f_rest_row" style="display:none"><span>forecast rest of day</span><span class="v" id="f_rest">-</span></div>
   <div class="row" id="f_factor_row" style="display:none"><span>factor today</span><span class="v" id="f_factor">-</span></div>
-  <div class="row" id="f_best_row" style="display:none" title="Regel B (die des Eigentuemers), saisonal-relativ: eine Tagessumme nahe am Bestwert dieser Jahreszeit kann ohne starken Nachmittag nicht zustande kommen - deshalb darf das Auto morgens zuerst. Eine mittlere Prognose sagt dagegen nichts darueber, welche Tageshaelfte gut wird. Geprueft an 7 Tagen mit 15-Minuten-Exporten: ab 88 Prozent des Bestwerts war der Nachmittag jedes Mal stark, bei 71-78 Prozent jedes Mal mittel bis schwach. Der Bestwert ist der beste VOLLSTAENDIGE Tag der letzten 30 (Tage, deren Zaehlerbasis nicht um Mitternacht lag, zaehlen nicht) - die Schwelle waechst also mit der Jahreszeit mit.">
+  <div class="row" id="f_best_row" style="display:none" title="Rule B (the owner's), seasonal-relative: a day total near the best value of this season cannot come about without a strong afternoon - which is why the car may go first in the morning. A middling forecast says nothing about which half of the day will be good. Checked against 7 days of 15-minute exports: from 88 percent of the best value the afternoon was strong every time, at 71-78 percent it was middling to weak every time. The best value is the best COMPLETE day of the last 30 (days whose counter baseline was not taken at midnight do not count) - so the threshold grows with the season.">
     <span>forecast vs best day (30d)</span><span class="v" id="f_best">-</span></div>
   <div class="row" id="f_would_row" style="display:none"><span>rule A (factor+margin) would say</span><span class="v" id="f_would">-</span></div>
   <div class="row" id="f_rb_row" style="display:none"><span>rule B (season) would say</span><span class="v" id="f_rb">-</span></div>
@@ -1168,8 +1253,6 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
   <label>max current <input id="set_max_current" type="number" step="0.5"></label>
   <label title="Above this SOC the reserve above the buffer may carry a running charge: pv/minpv holds the car at the minimum current instead of switching it off when the sun goes, drawn from the battery - and lets go once the SOC is back down at this level, so the reserve is never spent below it.">buffer SOC <input id="set_buffer_soc" type="number" step="1"></label>
   <label title="Below this SOC the house battery has priority: what it is taking stays with it (the car charges on the real export only, which is not blocked), and while the battery supplies the car with nothing being exported the charge stops. From this SOC up the car gets the battery's charging share too, so it outranks the battery's charging instead of waiting for it to finish.">priority SOC <input id="set_priority_soc" type="number" step="1"></label>
-  <label>plan kWh <input id="set_plan_energy_kwh" type="number" step="1"></label>
-  <label>plan by <input id="set_plan_deadline" type="text" placeholder="07:30"></label>
   <label>cheap hours <input id="set_cheap_hours" type="text" style="width:140px" placeholder="00:00-05:00"></label>
   <label>time zone <input id="set_timezone" type="text" style="width:140px" placeholder="Europe/Berlin"></label>
   <div style="margin-top:10px"><button id="save">Save</button>
@@ -1191,6 +1274,27 @@ UI_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <script>
 const MODES=["off","now","minpv","pv","cheap_hours","manual"];
 const MODE_HINT={cheap_hours:"uses the cheap_hours window, plus PV when the sun turns up"};
+// The settings card's input fields. A field the owner is typing in - or has typed in and
+// not saved yet - must NOT be repainted: the page polls the state every 3 s and used to
+// write every field from it unconditionally, so a number typed into an input was back to
+// the old value before the Save button could be reached (measured: 1 -> 0 within 4 s).
+// `dirty` is set on the first keystroke and cleared when a save has been sent - from then
+// on the server's answer is what the field shows.
+const SET_KEYS=["min_current","max_current","buffer_soc","priority_soc",
+                "cheap_hours","timezone"];
+function setField(k){return document.getElementById("set_"+k);}
+function fillSettings(st){
+ for(const k of SET_KEYS){const el=setField(k);if(!el||st[k]===undefined)continue;
+  if(el===document.activeElement||el.dataset.dirty==="1")continue;
+  el.value=Array.isArray(st[k])?st[k].join(","):st[k];}
+}
+function bindSettingsInputs(){
+ for(const k of SET_KEYS){const el=setField(k);
+  if(el)el.addEventListener("input",()=>{el.dataset.dirty="1";});}
+}
+function clearDirtySettings(){
+ for(const k of SET_KEYS){const el=setField(k);if(el)delete el.dataset.dirty;}
+}
 function w(x){if(x===null||x===undefined)return "-";if(Math.abs(x)>=1000)return (x/1000).toFixed(2)+" kW";return Math.round(x)+" W";}
 async function load(){
  const r=await fetch("api/state");const s=await r.json();
@@ -1227,7 +1331,7 @@ async function load(){
  // grace countdown: the state carries the seconds left, the page ticks them down
  // locally so the number moves between the 30 s state refreshes.
  if(d.disable_in_s>0){window._graceDeadline=Date.now()/1000+d.disable_in_s;window._graceKind="stop";}
- else if(d.enable_in_s>0){window._graceDeadline=Date.now()/1000+d.enable_in_s;window._graceKind=d.plan_wait?"plan":"start";}
+ else if(d.enable_in_s>0){window._graceDeadline=Date.now()/1000+d.enable_in_s;window._graceKind="start";}
  else{window._graceDeadline=0;window._graceKind="";}
  graceTick();
  // manual mode: show what the wallbox is actually set to, and how long we have been out of the way
@@ -1260,17 +1364,32 @@ async function load(){
    // is enabled, because it costs nothing extra (its register is in the window already).
    const seRow=document.getElementById("f_se_row"), seVal=document.getElementById("f_se");
    const hasSe=(f.se_lifetime_kwh!==null&&f.se_lifetime_kwh!==undefined);
+   // The garage (Deye) stands NEXT TO the inverter counter, never inside it: the house battery
+   // can only be charged by the SolarEdge, so a combined figure would mean something else. A
+   // trailing * marks a baseline that was not taken at the day's start (fresh service start).
+   const gd=s.garage_day||{};
+   const gdHas=(gd.day_kwh!==null&&gd.day_kwh!==undefined);
+   const gdTxt=gdHas?(Number(gd.day_kwh).toFixed(2)+(gd.partial?"*":"")):"-";
    seRow.style.display=hasSe?"":"none";
    if(hasSe){
-     seVal.textContent=(f.se_today_kwh===null||f.se_today_kwh===undefined)
-       ?"Zaehler laeuft":(Number(f.se_today_kwh).toFixed(2)+" kWh")+(f.se_partial?" (Teil-Tag)":"");
-     seVal.title="Wechselrichter-Zaehler: heute "+((f.se_today_kwh===null||f.se_today_kwh===undefined)
-         ?"noch keine Differenz - der Tagesbeginn wird beim ersten Lesen verankert"
+     seVal.textContent=((f.se_today_kwh===null||f.se_today_kwh===undefined)
+       ?"counter running":(Number(f.se_today_kwh).toFixed(2)+" kWh")+(f.se_partial?" (partial day)":""))
+       +" / "+gdTxt;
+     seVal.title="Inverter output today (SunSpec WH, day's difference) "
+       +((f.se_today_kwh===null||f.se_today_kwh===undefined)
+         ?"no difference yet - the day's start is latched on the first reading"
          :Number(f.se_today_kwh).toFixed(3)+" kWh")
-       +" | Lebensdauer gesamt "+Number(f.se_lifetime_kwh).toLocaleString("de-DE")+" kWh"
-       +(f.se_partial?" | ACHTUNG Teil-Tag: die Verankerung lag nicht um Mitternacht, die Zahl deckt"
-         +" nur den Teil seit dem Dienststart ab":"")
-       +" | aus dem ohnehin gelesenen Registerfenster (kein zusaetzlicher Modbus-Verkehr)";
+       +" | lifetime total "+Number(f.se_lifetime_kwh).toLocaleString("en-GB")+" kWh"
+       +(f.se_partial?" | NOTE partial day: the baseline was not latched at midnight, so the figure"
+         +" covers only the part since the service started":"")
+       +" || garage (Deye) today "
+       +(gdHas?Number(gd.day_kwh).toFixed(3)+" kWh"
+              +(gd.partial?" (partial day, since the service started)":"")
+              +" | counter reading "+Number(gd.counter_kwh||0).toFixed(1)+" kWh"
+         :"no value")
+       +" - from Home Assistant, deliberately NOT added in (only the SolarEdge can charge the"
+       +" house battery) | the inverter's figure comes from the register window we read anyway"
+       +" (no extra Modbus traffic)";
    }
    ids.forEach(function(id){document.getElementById(id).style.display=f.enabled?"":"none";});
    if(!f.enabled){return;}
@@ -1280,67 +1399,67 @@ async function load(){
          fac=document.getElementById("f_factor"), wld=document.getElementById("f_would");
    const pl=(f.planes||[]).map(p=>p.kwp+" kWp @ "+p.azimuth+"deg/"+p.tilt+"deg").join(" + ");
    const age=(f.age_min===null||f.age_min===undefined)?null:Number(f.age_min);
-   day.textContent=(f.today_kwh===undefined)?"keine Prognose":k(f.today_kwh);
-   day.title="Ganze Prognose fuer heute: "+k(f.today_kwh)+" AC (PR "+f.pr+")"
-     +" | bis jetzt erwartet: "+k(f.expected_so_far_kwh)
-     +" | gemessen (AC, integriert): "+k(f.measured_kwh)
-     +" | Quelle: Open-Meteo Stundensummen, "+pl
-     +(age===null?"":" | Prognose "+Math.round(age)+" min alt")
-     +(f.stale?" | STALE: letzte Aktualisierung fehlgeschlagen, es steht noch die alte Prognose":"")
-     +" | NUR ANZEIGE UND LOG, kein Steuereingriff";
+   day.textContent=(f.today_kwh===undefined)?"no forecast":k(f.today_kwh);
+   day.title="Whole forecast for today: "+k(f.today_kwh)+" AC (PR "+f.pr+")"
+     +" | expected by now: "+k(f.expected_so_far_kwh)
+     +" | measured (PV production = inverter output + battery charge): "+k(f.measured_kwh)
+     +" | source: Open-Meteo hourly totals, "+pl
+     +(age===null?"":" | forecast "+Math.round(age)+" min old")
+     +(f.stale?" | STALE: the last update failed, the previous forecast is still standing":"")
+     +" | DISPLAY AND LOG ONLY, it steers nothing";
    rest.textContent=(f.remaining_kwh===undefined)?"-":(k(f.remaining_kwh)
-     +(f.remaining_corrected_kwh!==undefined?" ("+k(f.remaining_corrected_kwh)+" korr.)":""));
+     +(f.remaining_corrected_kwh!==undefined?" ("+k(f.remaining_corrected_kwh)+" corr.)":""));
    rest.title=(f.remaining_corrected_kwh!==undefined)
-     ?("Rest der Prognose fuer heute "+k(f.remaining_kwh)+", mit dem heutigen Faktor "+n2(f.factor_today)
-       +" auf "+k(f.remaining_corrected_kwh)+" korrigiert")
-     :("Rest der Prognose fuer heute "+k(f.remaining_kwh)+" - noch kein Faktor, weil zu wenig Tag vorbei ist");
-   fac.textContent=(f.factor_today===null||f.factor_today===undefined)?"noch keine Basis":n2(f.factor_today);
-   fac.title="gemessen heute / Prognose fuer genau dieses Fenster. Unter 0.3 kWh Prognose wird kein "
-     +"Faktor gebildet - das waere eine Division durch Rauschen (Vorlauf des Tages, truebe Stunden).";
+     ?("Rest of today's forecast "+k(f.remaining_kwh)+", corrected with today's factor "+n2(f.factor_today)
+       +" to "+k(f.remaining_corrected_kwh))
+     :("Rest of today's forecast "+k(f.remaining_kwh)+" - no factor yet, too little of the day has passed");
+   fac.textContent=(f.factor_today===null||f.factor_today===undefined)?"no basis yet":n2(f.factor_today);
+   fac.title="measured today / forecast for exactly this window. Below 0.3 kWh of forecast no "
+     +"factor is formed - that would be dividing by noise (early daylight, dull hours).";
    // Rule B (the owner's, seasonal-relative) next to rule A (the older factor+margin one).
    // Both are computed and logged every day even though neither steers anything - that is
    // exactly how the two can be compared against real days later.
    const br=document.getElementById("f_best"), rb=document.getElementById("f_rb");
    br.textContent=(f.rule_best_kwh===null||f.rule_best_kwh===undefined)
-     ?"keine Referenz":(Math.round(f.rule_pct_of_best)+" % von "+k(f.rule_best_kwh)
-       +" (Schwelle "+k(f.rule_threshold_kwh)+" = "+Math.round(f.rule_best_fraction*100)+" %)");
-   br.title="Prognose heute "+k(f.today_kwh)+" gegen den besten VOLLSTAENDIGEN Tag der letzten 30: "
-     +k(f.rule_best_kwh)+" -> Schwelle "+k(f.rule_threshold_kwh)
-     +" | Der Bestwert waechst mit der Jahreszeit mit (Juni rund 52 kWh, September rund 33 kWh), "
-     +"deshalb ist die Schwelle relativ und nicht fest."
-     +" | Belegt an 7 Tagen mit 15-Minuten-Daten: ab 88 % des Bestwerts war der Nachmittag 3x stark "
-     +"(17.9-19.2 kWh in 12-18 Uhr), bei 71-78 % 3x mittel bis schwach (8.9-14.1 kWh), ohne "
-     +"Ueberschneidung zwischen den Gruppen."
-     +" | NUR ANZEIGE UND LOG, kein Steuereingriff.";
+     ?"no reference":(Math.round(f.rule_pct_of_best)+" % of "+k(f.rule_best_kwh)
+       +" (threshold "+k(f.rule_threshold_kwh)+" = "+Math.round(f.rule_best_fraction*100)+" %)");
+   br.title="Today's forecast "+k(f.today_kwh)+" against the best COMPLETE day of the last 30: "
+     +k(f.rule_best_kwh)+" -> threshold "+k(f.rule_threshold_kwh)
+     +" | The best value grows with the season (June around 52 kWh, September around 33 kWh), "
+     +"which is why the threshold is relative and not fixed."
+     +" | Backed by 7 days of 15-minute data: from 88 % of the best value the afternoon was strong "
+     +"3 times (17.9-19.2 kWh between 12 and 18 h), at 71-78 % it was middling to weak 3 times "
+     +"(8.9-14.1 kWh), with no overlap between the two groups."
+     +" | DISPLAY AND LOG ONLY, it steers nothing.";
    if(f.rule_says&&f.rule_says!=="no_data"){
-     rb.textContent=(f.rule_says==="car"?"Auto-Vorrang (Nachmittag kommt)":"Akku-Vorrang (Prognose sagt nichts)");
+     rb.textContent=(f.rule_says==="car"?"Car priority (the afternoon is coming)":"Battery priority (the forecast says nothing)");
      rb.className="v"+(f.rule_says==="battery"?" warn":"");
-     rb.title="Regel B, saisonal-relativ: Prognose heute "+k(f.today_kwh)+" = "
-       +Math.round(f.rule_pct_of_best)+" % vom besten Tag der letzten 30 ("+k(f.rule_best_kwh)
-       +"), Schwelle "+Math.round(f.rule_best_fraction*100)+" % = "+k(f.rule_threshold_kwh)+". "
+     rb.title="Rule B, seasonal-relative: today's forecast "+k(f.today_kwh)+" = "
+       +Math.round(f.rule_pct_of_best)+" % of the best day of the last 30 ("+k(f.rule_best_kwh)
+       +"), threshold "+Math.round(f.rule_best_fraction*100)+" % = "+k(f.rule_threshold_kwh)+". "
        +(f.rule_says==="car"
-         ?"Ueber der Schwelle: eine solche Tagessumme ist ohne starken Nachmittag nicht moeglich, "
-          +"das Auto darf morgens zuerst."
-         :"Unter der Schwelle: die Prognose sagt nichts ueber die Tageshaelfte, also bleibt der Akku "
-          +"zuerst dran - das Auto laedt weiter nur auf dem gemessenen Ueberschuss.")
-       +" NUR ANZEIGE UND LOG, kein Steuereingriff.";
+         ?"Above the threshold: a day total like that cannot come about without a strong afternoon, "
+          +"so the car may go first in the morning."
+         :"Below the threshold: the forecast says nothing about which half of the day will be good, "
+          +"so the battery stays first - the car keeps charging on the measured surplus only.")
+       +" DISPLAY AND LOG ONLY, it steers nothing.";
    }else{
-     rb.textContent="keine Referenz (noch kein vollstaendiger Tag)";
-     rb.title="Regel B braucht den besten VOLLSTAENDIGEN Tag der letzten 30 als Referenz. Solange "
-       +"keiner vorliegt, gibt es kein Urteil - eine Regel ohne Messbasis waere geraten.";
+     rb.textContent="no reference (no complete day yet)";
+     rb.title="Rule B needs the best COMPLETE day of the last 30 as its reference. Until there is "
+       +"one there is no verdict - a rule without a measured basis would be guessed.";
    }
    if(f.would_be_text){
      wld.textContent=f.would_be_text;
      wld.className="v"+(f.would_be==="battery"?" warn":"");
-     wld.title="NUR ANZEIGE - diese Regel ist NICHT verdrahtet, es wird nichts geschaltet. "
-       +"Rechnung: Rest-Prognose korrigiert "+k(f.remaining_corrected_kwh)+" minus angenommener "
-       +"Hausverbrauch "+k(f.house_rest_kwh)+" = "+k(f.supply_after_house_kwh)+" gegen Akku-Bedarf "
-       +"("+f.soc_target+" % Ziel - "+n2(f.soc)+" % jetzt) x "+f.capacity_kwh+" kWh = "
-       +k(f.battery_need_kwh)+", mit Marge "+f.margin;
+     wld.title="DISPLAY ONLY - this rule is NOT wired up, nothing is switched. "
+       +"Arithmetic: rest of the forecast, corrected, "+k(f.remaining_corrected_kwh)+" minus assumed "
+       +"house consumption "+k(f.house_rest_kwh)+" = "+k(f.supply_after_house_kwh)+" against the "
+       +"battery's need ("+f.soc_target+" % target - "+n2(f.soc)+" % now) x "+f.capacity_kwh+" kWh = "
+       +k(f.battery_need_kwh)+", with a margin of "+f.margin;
    }else{
      wld.textContent="-";
-     wld.title="noch keine Entscheidungsgrundlage: es fehlt der Tages-Faktor (zu wenig Messung "
-      +"bisher), die Rest-Prognose oder der SOC";
+     wld.title="no basis for a verdict yet: the day's factor is missing (too little measurement "
+      +"so far), or the rest-of-day forecast, or the SOC";
    }
  })();
  document.getElementById("c_state").textContent=c.car_state||"-";
@@ -1448,15 +1567,15 @@ async function load(){
  document.getElementById("p_uptime").textContent=px.uptime_s?(Math.floor(px.uptime_s/3600)+"h "+Math.floor((px.uptime_s%3600)/60)+"m"):"-";
  const p_le=document.getElementById("p_lasterr");
  const ago=(sec)=>{ if(sec==null) return "";
-   if(sec<90) return "vor "+Math.round(sec)+" s";
-   if(sec<3600) return "vor "+Math.round(sec/60)+" min";
-   if(sec<5400) return "vor einer Stunde";
-   if(sec<79200) return "vor "+Math.round(sec/3600)+" Stunden";
-   return "vor "+Math.round(sec/86400)+" Tagen"; };
+   if(sec<90) return Math.round(sec)+" s ago";
+   if(sec<3600) return Math.round(sec/60)+" min ago";
+   if(sec<5400) return "an hour ago";
+   if(sec<79200) return Math.round(sec/3600)+" hours ago";
+   return Math.round(sec/86400)+" days ago"; };
  p_le.textContent=px.last_error?((px.last_error_age_s!=null?(ago(px.last_error_age_s)+" \u00b7 "):"")
    +px.last_error):"-";
- p_le.title=px.last_error?((px.last_error_age_s!=null?("aufgetreten "+ago(px.last_error_age_s)
-   +" ("+new Date((px.last_error_at||0)*1000).toLocaleTimeString()+" Uhr) | "):"")+px.last_error):"";
+ p_le.title=px.last_error?((px.last_error_age_s!=null?("occurred "+ago(px.last_error_age_s)
+   +" ("+new Date((px.last_error_at||0)*1000).toLocaleTimeString("en-GB",{hour12:false})+" local) | "):"")+px.last_error):"";
  p_le.className="v"+(px.last_error?" warn":"");
  const st=s.settings||{};
  // Charge-switching safety: how many on/off edges the wallbox has really seen, and the
@@ -1485,9 +1604,7 @@ async function load(){
   document.getElementById("d_cheap").textContent=cw.windows.join(", ")+" | "+cw.local+" "+cw.tz+" | "+nx;
   dcr.style.display="";
  }
- for(const k of ["min_current","max_current","buffer_soc","priority_soc","plan_energy_kwh","plan_deadline","cheap_hours","timezone"]){
-   const el=document.getElementById("set_"+k); if(el&&st[k]!==undefined) el.value=Array.isArray(st[k])?st[k].join(","):st[k];
- }
+ fillSettings(st);       // never overwrite a field that is being edited (see SET_KEYS)
  // Who gets the sun: the two battery bands, stated where the numbers are. Without this
  // the rule is invisible - the app just appears to charge at odd times.
  const BAT_HELP="The house battery has three bands. Below priority SOC it has priority: its "
@@ -1531,8 +1648,8 @@ function graceTick(){
  const left=window._graceDeadline-Date.now()/1000;
  if(left<=0){row.style.display="none";return;}
  const fmt=left>=90?Math.floor(left/60)+" min "+String(Math.round(left%60)).padStart(2,"0")+" s":Math.round(left)+" s";
- const pre=window._graceKind==="stop"?"stopping charging in ":(window._graceKind==="plan"?"plan: must start charging in ":"starting to charge in ");
- const tail=window._graceKind==="stop"?" if it doesn't get better":(window._graceKind==="plan"?" to be ready in time":" if the surplus holds");
+ const pre=window._graceKind==="stop"?"stopping charging in ":"starting to charge in ";
+ const tail=window._graceKind==="stop"?" if it doesn't get better":" if the surplus holds";
  document.getElementById("d_grace").textContent=pre+fmt+tail;
  row.style.display="";
 }
@@ -1541,11 +1658,16 @@ async function post(path,body){
  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
  document.getElementById("msg").textContent=await r.text();load();
 }
-document.getElementById("save").onclick=()=>{
- const keys=["min_current","max_current","buffer_soc","priority_soc","plan_energy_kwh","plan_deadline","cheap_hours","timezone"];
- const o={};for(const k of keys){const v=document.getElementById("set_"+k).value;if(v!=="")o[k]=v;}
- post("api/settings",o);
+document.getElementById("save").onclick=async()=>{
+ const o={};for(const k of SET_KEYS){const v=setField(k).value;if(v!=="")o[k]=v;}
+ await post("api/settings",o);
+ // The save is out, so the server's answer is the truth again - let the fields be
+ // repainted from it. A value the server rejects then visibly comes back as what is
+ // really in force instead of sitting in the box looking saved.
+ clearDirtySettings();
+ load();
 };
+bindSettingsInputs();
 load();setInterval(load,3000);
 </script></body></html>"""
 
@@ -1644,8 +1766,6 @@ ADDON_OPTION_MAP = {
     "priority_soc": ("settings", "priority_soc"),
     "residual_power_w": ("settings", "residual_power_w"),
     "cheap_hours": ("settings", "cheap_hours"),
-    "plan_energy_kwh": ("settings", "plan_energy_kwh"),
-    "plan_deadline": ("settings", "plan_deadline"),
     "control_enabled": ("settings", "control_enabled"),
 }
 

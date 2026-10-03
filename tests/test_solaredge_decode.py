@@ -175,7 +175,8 @@ check("it stays at three window reads - the counter costs no extra Modbus traffi
       str(_site.client.reads))
 
 print("the driver is read-only: no path from this app into the inverter")
-# The owner's rule (\"Ich will nicht Akku steuern\") is a property of the code, so it is
+# The owner's rule ("Ich will nicht Akku steuern" - I do not want to control the battery) is a
+# property of the code, so it is
 # pinned here structurally: the Modbus client has no write method, the site driver has
 # nothing that steers the battery, and the control/limit register addresses must not
 # reappear in the *code* (the module docstring may name them, to explain why they are gone).

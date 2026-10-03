@@ -10,7 +10,8 @@ from the meter on the garage feeder:
 The SDM630 measures the garage feeder, and the garage PV feeds into that same feeder, so
 the figure is the *meter's* view of the session: what the car drew minus what the garage PV
 delivered at that moment. The owner accepts that on purpose ("das nehme ich in Kauf und
-möchte das nicht herausrechnen"), so nothing here corrects it - but the export counter is
+möchte das nicht herausrechnen" - I accept that and do not want it subtracted out), so
+nothing here corrects it - but the export counter is
 recorded next to the import one, so the PV share stays visible instead of vanishing into a
 single number.
 

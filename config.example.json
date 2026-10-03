@@ -66,8 +66,6 @@
     "control_enabled": false,
     "max_current_step": 1.0,
     "min_change_interval_s": 30,
-    "plan_energy_kwh": 0.0,
-    "plan_deadline": "",
     "site_stale_s": 600.0,
     "timezone": "Europe/Berlin"
   },

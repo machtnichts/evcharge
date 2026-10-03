@@ -9,7 +9,7 @@ Modes
 Settings cover the parts that matter for this installation:
     min/max current, phases, enable/disable thresholds and delays,
     battery buffer SOC (battery charges first), priority SOC,
-    cheap-tariff windows, and a simple "charge to X kWh by HH:MM" plan.
+    cheap-tariff windows.
 
 The controller is pure logic: it takes a SiteState + ChargerState + settings and
 returns a Decision. All hardware writes happen in the service layer, and only
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from typing import Dict, List, Optional
 
 from .drivers.solaredge import SiteState
@@ -54,7 +54,7 @@ class Settings:
     residual_power_w: float = 0.0       # reserve kept below the surplus; 0 = off (the
                                         # meter already measures the house's own load)
     cheap_hours: List[str] = field(default_factory=lambda: ["00:00-05:00"])
-    # The zone the cheap_hours window (and the plan deadline) are stated in. Empty means
+    # The zone the cheap_hours window is stated in. Empty means
     # the host's own clock; an IANA name is DST-correct through the standard library, so
     # "00:00-05:00" keeps meaning midnight-to-five on the house's wall as the seasons
     # change. A wrong zone here silently shifts every night-time charge by hours.
@@ -66,8 +66,6 @@ class Settings:
     max_current_step: float = 1.0       # unused: the current follows the surplus at once
     min_change_interval_s: int = 30
     site_stale_s: float = 600.0         # refuse to act on a site reading older than this
-    plan_energy_kwh: float = 0.0        # charge this much ...
-    plan_deadline: str = ""             # ... by this local time (HH:MM)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -84,13 +82,10 @@ class Decision:
     surplus_w: float = 0.0
     available_w: float = 0.0
     granted_w: float = 0.0
-    planned_kwh: float = 0.0
-    plan_active: bool = False
     cheap_now: bool = False
     blocked_by: str = ""
-    enable_in_s: float = 0.0            # s until the app wants to charge (grace or plan)
+    enable_in_s: float = 0.0            # s until the app wants to charge (enable grace)
     disable_in_s: float = 0.0           # seconds left of the disable grace (0 = none)
-    plan_wait: bool = False             # waiting for a deadline charge to be due
     actions: List[str] = field(default_factory=list)
     # Which phase count the maths used, and where it came from: measured from current
     # that actually flowed ("checked") or the configured assumption ("assumed"). The two
@@ -215,6 +210,25 @@ class ChargingController:
         hi = max(lo, self.s.max_current)
         return lo, hi
 
+    def _surplus_phrase(self, site, surplus_w: float) -> str:
+        """What the surplus figure really *is*, because the bare word misleads.
+
+        The number is exported power plus the car's own draw minus the house battery's
+        discharge. While the roof covers everything and something is left for the grid,
+        "surplus" is exactly right. When the battery is carrying the car there is **no
+        surplus at all** - the roof contributes only part of the draw and the rest comes
+        out of the storage, so calling the remainder a surplus reads as if the sun had
+        power to spare. The owner rejected that wording and he is right: the situation is
+        an over-full battery, not a surplus. The label states the number either way, so
+        the sentence around it keeps reading correctly.
+        """
+        if getattr(site, "exporting_w", 0.0) > 50:
+            return "surplus %.0f W" % surplus_w
+        if getattr(site, "battery_discharging_w", 0.0) > 50:
+            return ("no surplus - battery carrying the car, roof covers %.0f W"
+                    % surplus_w)
+        return "no surplus - roof covers %.0f W" % surplus_w
+
     def _power_for_current(self, amps: float, phases: Optional[int] = None) -> float:
         return amps * (phases or self.s.phases) * self.s.voltage_nominal
 
@@ -274,7 +288,7 @@ class ChargingController:
 
     # -- main decision ---------------------------------------------------
     def decide(self, site: SiteState, charger: ChargerState,
-               now: Optional[datetime] = None, session_kwh: float = 0.0,
+               now: Optional[datetime] = None,
                site_stale_s: float = 0.0) -> Decision:
         now = now or plant_now(self.s.timezone)
         s = self.s
@@ -413,31 +427,6 @@ class ChargingController:
                         "max until the window closes")
             return self._finalize(d, charger, now)
 
-        # plan support: reach a deadline with a known amount of energy. The rate needed
-        # to finish in time is the floor; any surplus on top of it goes into the car as
-        # well, so a deadline charge still uses the sun when there is one.
-        plan_w = self._plan_required_w(session_kwh, now, d)
-        if plan_w > 0:
-            need_a = plan_w / (ph * s.voltage_nominal) if ph else 0.0
-            if need_a < lo and not charger.charging:
-                # Stretch: the deadline needs less than the car's minimum current, so
-                # starting now would finish hours early on grid power nobody asked for.
-                # Hold off until the required rate reaches the minimum; the web UI
-                # counts that down.
-                self._enable_since = None       # a deliberate wait, not an enable grace
-                d.charge = False
-                d.plan_wait = True
-                d.enable_in_s = self._plan_start_in_s(plan_w, d.planned_kwh, lo, ph)
-                d.reason = ("plan: %.1f kWh to go, %.0f W needed - under the %.1f A "
-                            "minimum, holding off" % (d.planned_kwh, plan_w, lo))
-            else:
-                sun_a = surplus / (ph * s.voltage_nominal) if ph else 0.0
-                d.plan_active = True
-                d.target_current = max(lo, min(hi, max(need_a, sun_a)))
-                d.charge = True
-                d.reason = "plan: %.1f kWh to go, need %.0f W" % (d.planned_kwh, plan_w)
-            return self._finalize(d, charger, now)
-
         if s.mode == MODE_MINPV:
             min_start = self._power_for_current(lo, ph)
             floor = self._floor_w(min_start, charger)
@@ -445,10 +434,12 @@ class ChargingController:
             if ph and surplus >= floor:
                 d.charge = True
                 d.target_current = lo
-                d.reason = "minpv: surplus %.0f W >= %.0f W (%dp)" % (surplus, floor, ph)
+                d.reason = "minpv: %s >= %.0f W (%dp)" % (
+                    self._surplus_phrase(site, surplus), floor, ph)
             else:
                 d.charge = False
-                d.reason = "minpv: surplus %.0f W below %.0f W (%dp)" % (surplus, floor, ph)
+                d.reason = "minpv: %s; below %.0f W (%dp)" % (
+                    self._surplus_phrase(site, surplus), floor, ph)
             return self._finalize(d, charger, now)
 
         # MODE_PV (and MODE_CHEAP outside its cheap window): the current follows the
@@ -471,45 +462,13 @@ class ChargingController:
             # car keeps charging at 6 A and the small deficit comes off the house battery,
             # which is the whole point of holding instead of stopping.
             d.target_current = max(lo, min(hi, raw))
-            d.reason = "%s: surplus %.0f W -> %.1f A (%dp)" % (
-                tag, surplus, d.target_current, ph)
+            d.reason = "%s: %s -> %.1f A (%dp)" % (
+                tag, self._surplus_phrase(site, surplus), d.target_current, ph)
         else:
             d.charge = False
-            d.reason = "%s: surplus %.0f W below minimum (%.0f W, %dp)" % (tag, surplus, floor, ph)
+            d.reason = "%s: %s; below minimum (%.0f W, %dp)" % (
+                tag, self._surplus_phrase(site, surplus), floor, ph)
         return self._finalize(d, charger, now)
-
-    # -- plan ------------------------------------------------------------
-    def _plan_required_w(self, session_kwh: float, now: datetime, d: Decision) -> float:
-        s = self.s
-        if s.plan_energy_kwh <= 0 or not s.plan_deadline:
-            return 0.0
-        deadline_time = _parse_hm(s.plan_deadline)
-        if deadline_time is None:
-            return 0.0
-        deadline = now.replace(hour=deadline_time.hour, minute=deadline_time.minute,
-                               second=0, microsecond=0)
-        if deadline <= now:                      # deadline already passed today
-            deadline = deadline + timedelta(days=1)
-        remaining_h = max(0.1, (deadline - now).total_seconds() / 3600.0)
-        to_go = max(0.0, s.plan_energy_kwh - session_kwh)
-        d.planned_kwh = round(to_go, 2)
-        if to_go <= 0:
-            return 0.0
-        return to_go * 1000.0 / remaining_h
-
-    def _plan_start_in_s(self, plan_w: float, to_go_kwh: float, lo: float, ph: int) -> float:
-        """Seconds until a stretched charge has to begin to be done by its deadline.
-
-        The deadline needs `to_go_kwh`; charging at the minimum current can deliver
-        `lo * phases * voltage` per hour, so the charge must start that many hours
-        before the deadline. What is left of the window is the wait.
-        """
-        if plan_w <= 0 or to_go_kwh <= 0:
-            return 0.0
-        hours_left = to_go_kwh * 1000.0 / plan_w
-        min_kw = lo * max(1, ph) * self.s.voltage_nominal / 1000.0
-        need_hours = to_go_kwh / min_kw if min_kw > 0 else 0.0
-        return max(0.0, (hours_left - need_hours) * 3600.0)
 
     # -- hysteresis / dwell timers ---------------------------------------
     def _finalize(self, d: Decision, charger: ChargerState, now: datetime) -> Decision:
@@ -572,7 +531,7 @@ class ChargingController:
         surplus_decision = (s.mode in (MODE_PV, MODE_MINPV)
                             or (s.mode == MODE_CHEAP and not d.cheap_now))
         lo, hi = self._currents_bounds()
-        if d.blocked_by and surplus_decision and not d.plan_active:
+        if d.blocked_by and surplus_decision:
             d.charge = False
             # blocked_by stays its own field: the API exposes it and the UI renders it
             # as a separate row. Appending it to `reason` produced one run-on line
@@ -585,8 +544,8 @@ class ChargingController:
         # when the SOC falls back to the buffer - from there the normal rules decide, i.e.
         # the charge stops. Starting a charge on battery energy is NOT this rule: only a
         # charge that is already running is held.
-        if (surplus_decision and charger.charging and not d.plan_active and not d.blocked_by
-                and not d.plan_wait and d.soc is not None and d.soc > s.buffer_soc
+        if (surplus_decision and charger.charging and not d.blocked_by
+                and d.soc is not None and d.soc > s.buffer_soc
                 and not d.charge and d.target_current < lo):
             d.charge = True
             d.target_current = lo
